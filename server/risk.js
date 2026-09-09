@@ -42,7 +42,7 @@ export function assessRisk(metrics, security = {}) {
   if (security?.proxy === true) add(6, 'Upgradeable/proxy contract');
 
   const onChain = securitySnapshot(address);
-  if (address) queueSecurity(address);
+  if (address && Number(metrics?.score || 0) >= 52) queueSecurity(address);
   if (onChain?.securityLevel === 'FLAGGED') {
     risk = Math.max(risk, 70);
     for (const flag of onChain.securityFlags || []) flags.push(flag);
