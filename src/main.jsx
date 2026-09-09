@@ -1,27 +1,152 @@
-import React,{useEffect,useMemo,useState} from 'react';
-import {createRoot} from 'react-dom/client';
+import React, { useEffect, useMemo, useState } from 'react';
+import { createRoot } from 'react-dom/client';
 import './styles.css';
-const API='/api';
-const short=a=>a?`${a.slice(0,6)}…${a.slice(-4)}`:'';
-const money=n=>n&&Number.isFinite(Number(n))?`$${Number(n)>=1e6?(Number(n)/1e6).toFixed(2)+'M':Number(n)>=1e3?(Number(n)/1e3).toFixed(1)+'K':Number(n).toFixed(0)}`:'—';
-function Icon({children}){return <span className="icon">{children}</span>}
-function App(){
- const [tab,setTab]=useState('EARLY'),[page,setPage]=useState('radar'),[selected,setSelected]=useState(null),[favorites,setFavorites]=useState(()=>JSON.parse(localStorage.getItem('rh-favs')||'[]')),[query,setQuery]=useState(''),[radar,setRadar]=useState([]),[status,setStatus]=useState({status:'STARTING'}),[notice,setNotice]=useState('');
- const load=async()=>{try{const [r,s]=await Promise.all([fetch(API+'/radar'),fetch(API+'/status')]);setRadar(await r.json());setStatus(await s.json())}catch(e){setNotice('Engine offline')}};
- useEffect(()=>{load();const id=setInterval(load,10000);return()=>clearInterval(id)},[]);
- useEffect(()=>localStorage.setItem('rh-favs',JSON.stringify(favorites)),[favorites]);
- const filtered=useMemo(()=>radar.filter(t=>tab==='ALL'||t.stage===tab||(tab==='RUNNING'&&t.stage==='PULLBACK')),[radar,tab]);
- const toggleFav=a=>setFavorites(f=>f.includes(a)?f.filter(x=>x!==a):[...f,a]);
- const openToken=async t=>{setSelected(t);setPage('detail');try{const r=await fetch(API+'/token/'+t.address);if(r.ok)setSelected(await r.json())}catch{}};
- const analyze=async()=>{if(!query.trim())return;const q=query.trim();if(/^0x[a-fA-F0-9]{40}$/.test(q)){try{const r=await fetch(API+'/token/'+q);if(!r.ok)throw 0;setSelected(await r.json());setPage('detail');return}catch{setNotice('Contract not found or RPC unavailable');return}}setNotice('Search accepts a contract address (0x...)');};
- return <div className="app"><header className="topbar"><button className="brand" onClick={()=>setPage('radar')}><div className="panther">◢</div><div><b>RUNNER<span>HUNTER</span></b><small>FIND · TRACK · ANALYZE</small></div></button><div className="live"><i className={status.status==='LIVE'?'':'off'}/>{status.status==='LIVE'?'RADAR LIVE':'RADAR '+status.status}<small>Chain 4663</small></div></header>
- {notice&&<button className="toast" onClick={()=>setNotice('')}>{notice}</button>}
- <main>{page==='radar'&&<><section className="hero"><div><p className="eyebrow">ROBINHOOD CHAIN</p><h1>Find the next runner.</h1><p className="muted">Live discovery from on-chain activity. No demo tokens.</p></div><div className="heroStats"><strong>{status.status||'—'}</strong><span>Block {status.latestBlock||'—'}</span><span>Cycle #{status.scanCycle||0}</span></div></section><div className="metrics"><div><b>{status.active||0}</b><span>Active candidates</span></div><div><b>{status.discovered||0}</b><span>Discovered</span></div><div><b>{favorites.length}</b><span>Favorites</span></div><div><b>{status.errors||0}</b><span>Errors</span></div></div><nav className="tabs">{['EARLY','GROWING','RUNNING','PULLBACK'].map(x=><button className={tab===x?'active':''} onClick={()=>setTab(x)} key={x}>{x}</button>)}</nav><section className="list">{filtered.length?filtered.map((t,i)=><div className="tokenRow" key={t.address} onClick={()=>openToken(t)}><div className="rank">{i+1}</div><div className="coin">{(t.symbol||'?')[0]}</div><div className="tokenName"><b>{t.name}</b><span>{t.symbol} · RH · {t.stage}</span></div><div className="numbers"><b>{money(t.marketCap)}</b><span>{t.buys} buys · {t.sells} sells</span></div><div className="score">{t.score}</div><div className="trend">{t.pressure.toFixed(0)}%</div><button className="star" onClick={e=>{e.stopPropagation();toggleFav(t.address)}}>{favorites.includes(t.address)?'★':'☆'}</button></div>):<div className="empty">No qualifying runners in this stage yet.<br/>The engine is scanning live chain activity.</div>}</section></>}
- {page==='detail'&&selected&&<TokenDetail t={selected} back={()=>setPage('radar')} fav={favorites.includes(selected.address)} toggle={()=>toggleFav(selected.address)}/>} {page==='search'&&<Search query={query} setQuery={setQuery} analyze={analyze}/>} {page==='favorites'&&<Favorites tokens={radar.filter(t=>favorites.includes(t.address))} open={openToken} toggle={toggleFav}/>} {page==='settings'&&<Settings status={status}/>}</main>
- <footer><button className={page==='radar'||page==='detail'?'sel':''} onClick={()=>setPage('radar')}><Icon>⌁</Icon>Radar</button><button className={page==='search'?'sel':''} onClick={()=>setPage('search')}><Icon>⌕</Icon>Search</button><button className={page==='favorites'?'sel':''} onClick={()=>setPage('favorites')}><Icon>★</Icon>Favorites</button><button className={page==='settings'?'sel':''} onClick={()=>setPage('settings')}><Icon>⚙</Icon>Settings</button></footer></div>;
+
+const API = '/api';
+const short = (a) => a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '';
+const money = (n) => {
+  const v = Number(n || 0);
+  if (!v) return '—';
+  if (v >= 1e6) return `$${(v / 1e6).toFixed(2)}M`;
+  if (v >= 1e3) return `$${(v / 1e3).toFixed(1)}K`;
+  return `$${v.toFixed(0)}`;
+};
+
+function Icon({ children }) { return <span className="icon">{children}</span>; }
+
+function App() {
+  const [tab, setTab] = useState('EARLY');
+  const [page, setPage] = useState('radar');
+  const [selected, setSelected] = useState(null);
+  const [favorites, setFavorites] = useState(() => JSON.parse(localStorage.getItem('rh-favs') || '[]'));
+  const [query, setQuery] = useState('');
+  const [radar, setRadar] = useState([]);
+  const [status, setStatus] = useState({ status: 'STARTING' });
+  const [notice, setNotice] = useState('');
+
+  async function load() {
+    try {
+      const [r, s] = await Promise.all([fetch(`${API}/radar`), fetch(`${API}/status`)]);
+      setRadar(await r.json());
+      setStatus(await s.json());
+    } catch {
+      setNotice('Engine offline');
+    }
+  }
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('rh-favs', JSON.stringify(favorites));
+  }, [favorites]);
+
+  const filtered = useMemo(() => radar.filter((t) => tab === t.stage || (tab === 'RUNNING' && t.stage === 'PULLBACK')), [radar, tab]);
+
+  function toggleFav(address) {
+    setFavorites((f) => f.includes(address) ? f.filter((x) => x !== address) : [...f, address]);
+  }
+
+  async function openToken(token) {
+    setSelected(token);
+    setPage('detail');
+    try {
+      const r = await fetch(`${API}/token/${token.address}`);
+      if (r.ok) setSelected(await r.json());
+    } catch {}
+  }
+
+  async function analyze() {
+    const q = query.trim();
+    if (!q) return;
+    if (!/^0x[a-fA-F0-9]{40}$/.test(q)) {
+      setNotice('Search accepts a Robinhood Chain contract address (0x...)');
+      return;
+    }
+    try {
+      const r = await fetch(`${API}/token/${q}`);
+      if (!r.ok) throw new Error('not found');
+      setSelected(await r.json());
+      setPage('detail');
+    } catch {
+      setNotice('Contract not found or RPC unavailable');
+    }
+  }
+
+  return (
+    <div className="app">
+      <header className="topbar">
+        <button className="brand" onClick={() => setPage('radar')}>
+          <div className="panther">◢</div>
+          <div><b>RUNNER<span>HUNTER</span></b><small>FIND · TRACK · ANALYZE</small></div>
+        </button>
+        <div className="live"><i className={status.status === 'LIVE' ? '' : 'off'} />{status.status === 'LIVE' ? 'RADAR LIVE' : `RADAR ${status.status}`}<small>Chain 4663</small></div>
+      </header>
+      {notice && <button className="toast" onClick={() => setNotice('')}>{notice}</button>}
+      <main>
+        {page === 'radar' && <Radar radar={radar} status={status} tab={tab} setTab={setTab} favorites={favorites} toggleFav={toggleFav} openToken={openToken} />}
+        {page === 'detail' && selected && <TokenDetail t={selected} back={() => setPage('radar')} fav={favorites.includes(selected.address)} toggle={() => toggleFav(selected.address)} />}
+        {page === 'search' && <Search query={query} setQuery={setQuery} analyze={analyze} />}
+        {page === 'favorites' && <Favorites tokens={radar.filter((t) => favorites.includes(t.address))} open={openToken} toggle={toggleFav} />}
+        {page === 'settings' && <Settings status={status} />}
+      </main>
+      <footer>
+        <button className={page === 'radar' || page === 'detail' ? 'sel' : ''} onClick={() => setPage('radar')}><Icon>⌁</Icon>Radar</button>
+        <button className={page === 'search' ? 'sel' : ''} onClick={() => setPage('search')}><Icon>⌕</Icon>Search</button>
+        <button className={page === 'favorites' ? 'sel' : ''} onClick={() => setPage('favorites')}><Icon>★</Icon>Favorites</button>
+        <button className={page === 'settings' ? 'sel' : ''} onClick={() => setPage('settings')}><Icon>⚙</Icon>Settings</button>
+      </footer>
+    </div>
+  );
 }
-function TokenDetail({t,back,fav,toggle}){return <section className="detail"><button className="back" onClick={back}>‹ Back</button><div className="detailHead"><div className="coin big">{(t.symbol||'?')[0]}</div><div><h2>{t.name}</h2><p>{t.symbol} · Robinhood Chain</p></div><button className="star bigStar" onClick={toggle}>{fav?'★':'☆'}</button></div><div className="scores"><div><span>RADAR SCORE</span><b>{t.score}</b></div><div><span>ORGANIC</span><b>{Math.round(t.organic)}</b></div><div><span>STAGE</span><b>{t.stage}</b></div></div><div className="price"><span>Market Cap</span><b>{money(t.marketCap)}</b><em>Price {t.price?Number(t.price).toPrecision(5):'—'}</em></div><div className="detailGrid"><div><span>Holders</span><b>{t.holders||'—'}</b></div><div><span>Buys / Sells</span><b>{t.buys} / {t.sells}</b></div><div><span>Buy pressure</span><b>{t.pressure.toFixed(0)}%</b></div><div><span>Momentum</span><b>{Math.round(t.momentum)}</b></div></div><div className="chart"><div className="chartLine"/><span>Score history</span><small>{(t.history||[]).map(x=>x.score).join(' · ')||'Waiting for history'}</small></div><div className="contract"><span>Contract</span><code>{short(t.address)}</code><button onClick={()=>navigator.clipboard?.writeText(t.address)}>Copy</button></div></section>}
-function Search({query,setQuery,analyze}){return <section className="searchPage"><p className="eyebrow">TOKEN INSPECTOR</p><h1>Analyze any token.</h1><p className="muted">Paste any Robinhood Chain contract. Same engine, same scoring.</p><div className="searchBox"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="0x... contract address"/><button onClick={analyze}>Analyze</button></div><div className="infoCard"><b>Live on-chain analysis</b><span>Metadata, activity, holders, buy/sell pressure and momentum are read from Robinhood Chain.</span></div></section>}
-function Favorites({tokens,open,toggle}){return <section><p className="eyebrow">SAVED</p><h1>My Favorites</h1>{tokens.length===0?<div className="empty">No favorites yet.<br/>Tap ☆ on a runner to save it.</div>:<section className="list">{tokens.map(t=><div className="tokenRow" key={t.address} onClick={()=>open(t)}><div className="coin">{(t.symbol||'?')[0]}</div><div className="tokenName"><b>{t.name}</b><span>{t.symbol} · RH</span></div><div className="numbers"><b>{money(t.marketCap)}</b><span>Score {t.score}</span></div><button className="star" onClick={e=>{e.stopPropagation();toggle(t.address)}}>★</button></div>)}</section>}</section>}
-function Settings({status}){return <section className="settings"><p className="eyebrow">SYSTEM</p><h1>Diagnostics</h1>{[['◉','Radar Engine',status.status||'—'],['⌁','Robinhood RPC','Chain ID 4663'],['◔','Scan cycle',`${status.scanCycle||0} · block ${status.latestBlock||'—'}`],['◐','Candidates',`${status.discovered||0} discovered · ${status.analyzed||0} analyzed`],['ⓘ','Warnings',(status.warnings||[]).slice(-1)[0]||'None']].map(x=><div className="setting" key={x[1]}><span>{x[0]}</span><div><b>{x[1]}</b><small>{x[2]}</small></div><strong>›</strong></div>)}</section>)}
-createRoot(document.getElementById('root')).render(<App/>);
+
+function Radar({ radar, status, tab, setTab, favorites, toggleFav, openToken }) {
+  const filtered = radar.filter((t) => tab === t.stage || (tab === 'RUNNING' && t.stage === 'PULLBACK'));
+  return <>
+    <section className="hero">
+      <div><p className="eyebrow">ROBINHOOD CHAIN</p><h1>Find the next runner.</h1><p className="muted">Live discovery from on-chain activity. No demo tokens.</p></div>
+      <div className="heroStats"><strong>{status.status || '—'}</strong><span>Block {status.latestBlock || '—'}</span><span>Cycle #{status.scanCycle || 0}</span></div>
+    </section>
+    <div className="metrics"><div><b>{status.active || 0}</b><span>Active candidates</span></div><div><b>{status.discovered || 0}</b><span>Discovered</span></div><div><b>{favorites.length}</b><span>Favorites</span></div><div><b>{status.errors || 0}</b><span>Errors</span></div></div>
+    <nav className="tabs">{['EARLY', 'GROWING', 'RUNNING', 'PULLBACK'].map((x) => <button key={x} className={tab === x ? 'active' : ''} onClick={() => setTab(x)}>{x}</button>)}</nav>
+    <section className="list">
+      {filtered.length ? filtered.map((t, i) => <div className="tokenRow" key={t.address} onClick={() => openToken(t)}>
+        <div className="rank">{i + 1}</div><div className="coin">{(t.symbol || '?')[0]}</div>
+        <div className="tokenName"><b>{t.name}</b><span>{t.symbol} · RH · {t.stage}</span></div>
+        <div className="numbers"><b>{money(t.marketCap)}</b><span>{t.buys} buys · {t.sells} sells</span></div>
+        <div className="score">{t.score}</div><div className="trend">{t.pressure}%</div>
+        <button className="star" onClick={(e) => { e.stopPropagation(); toggleFav(t.address); }}>{favorites.includes(t.address) ? '★' : '☆'}</button>
+      </div>) : <div className="empty">No qualifying runners in this stage yet.<br />The engine is scanning live chain activity.</div>}
+    </section>
+  </>;
+}
+
+function TokenDetail({ t, back, fav, toggle }) {
+  return <section className="detail">
+    <button className="back" onClick={back}>‹ Back</button>
+    <div className="detailHead"><div className="coin big">{(t.symbol || '?')[0]}</div><div><h2>{t.name}</h2><p>{t.symbol} · Robinhood Chain</p></div><button className="star bigStar" onClick={toggle}>{fav ? '★' : '☆'}</button></div>
+    <div className="scores"><div><span>RADAR SCORE</span><b>{t.score}</b></div><div><span>ORGANIC</span><b>{Math.round(t.organic)}</b></div><div><span>STAGE</span><b>{t.stage}</b></div></div>
+    <div className="price"><span>Market Cap</span><b>{money(t.marketCap)}</b><em>Price {t.price ? Number(t.price).toPrecision(5) : '—'}</em></div>
+    <div className="detailGrid"><div><span>Holders</span><b>{t.holders || '—'}</b></div><div><span>Buys / Sells</span><b>{t.buys} / {t.sells}</b></div><div><span>Buy pressure</span><b>{t.pressure}%</b></div><div><span>Momentum</span><b>{Math.round(t.momentum)}</b></div></div>
+    <div className="chart"><div className="chartLine" /><span>Score history</span><small>{(t.history || []).map((x) => x.score).join(' · ') || 'Waiting for history'}</small></div>
+    <div className="contract"><span>Contract</span><code>{short(t.address)}</code><button onClick={() => navigator.clipboard?.writeText(t.address)}>Copy</button></div>
+  </section>;
+}
+
+function Search({ query, setQuery, analyze }) {
+  return <section className="searchPage"><p className="eyebrow">TOKEN INSPECTOR</p><h1>Analyze any token.</h1><p className="muted">Paste any Robinhood Chain contract. Same engine, same scoring.</p><div className="searchBox"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="0x... contract address" /><button onClick={analyze}>Analyze</button></div><div className="infoCard"><b>Live on-chain analysis</b><span>Metadata, activity, holders, buy/sell pressure and momentum are read from Robinhood Chain.</span></div></section>;
+}
+
+function Favorites({ tokens, open, toggle }) {
+  return <section><p className="eyebrow">SAVED</p><h1>My Favorites</h1>{tokens.length === 0 ? <div className="empty">No favorites yet.<br />Tap ☆ on a runner to save it.</div> : <section className="list">{tokens.map((t) => <div className="tokenRow" key={t.address} onClick={() => open(t)}><div className="coin">{(t.symbol || '?')[0]}</div><div className="tokenName"><b>{t.name}</b><span>{t.symbol} · RH</span></div><div className="numbers"><b>{money(t.marketCap)}</b><span>Score {t.score}</span></div><button className="star" onClick={(e) => { e.stopPropagation(); toggle(t.address); }}>★</button></div>)}</section>}</section>;
+}
+
+function Settings({ status }) {
+  const rows = [['◉', 'Radar Engine', status.status || '—'], ['⌁', 'Robinhood RPC', 'Chain ID 4663'], ['◔', 'Scan cycle', `${status.scanCycle || 0} · block ${status.latestBlock || '—'}`], ['◐', 'Candidates', `${status.discovered || 0} discovered · ${status.analyzed || 0} analyzed`], ['ⓘ', 'Warnings', (status.warnings || []).slice(-1)[0] || 'None']];
+  return <section className="settings"><p className="eyebrow">SYSTEM</p><h1>Diagnostics</h1>{rows.map((x) => <div className="setting" key={x[1]}><span>{x[0]}</span><div><b>{x[1]}</b><small>{x[2]}</small></div><strong>›</strong></div>)}</section>;
+}
+
+createRoot(document.getElementById('root')).render(<App />);
