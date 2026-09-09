@@ -42,21 +42,6 @@ function htmlToText(html) {
     .replace(/&#44;/g, ',');
 }
 
-function logoFromHtml(html) {
-  const source = String(html || '');
-  const patterns = [
-    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
-    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i
-  ];
-  for (const re of patterns) {
-    const m = source.match(re);
-    if (m?.[1] && /^https?:\/\//i.test(m[1])) return m[1];
-  }
-  return '';
-}
-
 async function fetchHtml(url) {
   const r = await nativeFetch(url, {
     headers: { accept: 'text/html,application/xhtml+xml' },
@@ -92,13 +77,6 @@ async function logoFallback(address) {
     const r = await nativeFetch(robinhood, { method: 'HEAD', signal: AbortSignal.timeout(3500) });
     if (r.ok) return robinhood;
   } catch {}
-  for (const url of [`${BS}/token/${address}`, `${ROBINSCAN}/token/${address}`]) {
-    try {
-      const html = await fetchHtml(url);
-      const image = logoFromHtml(html);
-      if (image) return image;
-    } catch {}
-  }
   return '';
 }
 
@@ -141,6 +119,13 @@ globalThis.fetch = async (input, init = {}) => {
         const merged = counters
           ? { ...data, token_holders_count: String(extra.holders) }
           : { ...data, holders_count: String(extra.holders) };
+        if (!counters && !existingImage) {
+          const image = await logoFallback(address);
+          if (image) {
+            merged.icon_url = image;
+            merged.image_url = image;
+          }
+        }
         return jsonResponse(merged);
       }
       if (!counters && (data.icon_url || data.image_url)) return jsonResponse(data);
@@ -159,4 +144,4 @@ globalThis.fetch = async (input, init = {}) => {
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
-console.log('[runtime-patch] Blockscout holder + logo provider enabled: native -> Robinhood CDN -> Blockscout/Robinscan, logos preserved');
+console.log('[runtime-patch] Blockscout holder + logo provider enabled: native -> Robinhood CDN only, no explorer page images');
