@@ -7,7 +7,7 @@ const PORT=Number(process.env.PORT||10000),RPC_URL=process.env.RH_RPC_URL||'http
 const provider=new JsonRpcProvider(RPC_URL,4663,{staticNetwork:true});
 const TRANSFER_TOPIC='0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',ZERO='0x0000000000000000000000000000000000000000',WETH='0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const PAIR_CREATED_TOPIC='0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e',V3_POOL_TOPIC='0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4e6b7118',PONS_LAUNCHED=id('TokenLaunched(address,address,address,address,uint256,uint256)');
-const FACTORIES={'0x1f7d7550B1b028f7571E69A784071F0205FD2EfA'.toLowerCase():'Uniswap V3','0x8366a39cc670b4001a1121b8f6a443a643e40951'.toLowerCase():'Uniswap V4','0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB'.toLowerCase():'Pons V1','0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e'.toLowerCase():'Pons V2'};
+const FACTORIES={};FACTORIES['0x1f7d7550B1b028f7571E69A784071F0205FD2EfA'.toLowerCase()]='Uniswap V3';FACTORIES['0x8366a39cc670b4001a1121b8f6a443a643e40951'.toLowerCase()]='Uniswap V4';FACTORIES['0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB'.toLowerCase()]='Pons V1';FACTORIES['0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e'.toLowerCase()]='Pons V2';
 const erc20=new Interface(['function name() view returns (string)','function symbol() view returns (string)','function decimals() view returns (uint8)','function totalSupply() view returns (uint256)']);
 const cache=new Map(),codeCache=new Map(),poolSet=new Set(),history=new Map();
 let state={status:'STARTING',lastUpdate:null,scanCycle:0,discovered:0,analyzed:0,active:0,errors:0,warnings:[],latestBlock:null,uptime:0};const started=Date.now();
