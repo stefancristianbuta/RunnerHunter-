@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 const TARGET = new URL('./index.js', import.meta.url).href;
 const SECURITY = new URL('./security.js', import.meta.url).href;
 const HONEYPOT_BYTECODE = readFileSync(new URL('./honeypot-bytecode.txt', import.meta.url), 'utf8').trim();
+const BLOCKSCOUT = process.env.BLOCKSCOUT_URL || 'https://robinhoodchain.blockscout.com/api/v2';
 
 registerHooks({
   load(url, context, nextLoad) {
