@@ -18,7 +18,6 @@ const V3_POOL_TOPIC='0x783cca1c0412dd0d695e784568c96da2e9c22ff989357a2e8b1d9b2b4
 const PONS_LAUNCHED=id('TokenLaunched(address,address,address,address,uint256,uint256)');
 const FACTORIES={};
 FACTORIES['0x1f7d7550B1b028f7571E69A784071F0205FD2EfA'.toLowerCase()]='Uniswap V3';
-FACTORIES['0x8366a39cc670b4001a1121b8f6a443a643e40951'.toLowerCase()]='Uniswap V4';
 FACTORIES['0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB'.toLowerCase()]='Pons V1';
 FACTORIES['0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e'.toLowerCase()]='Pons V2';
 
@@ -35,9 +34,7 @@ const history=new Map();
 let state={status:'STARTING',lastUpdate:null,scanCycle:0,discovered:0,analyzed:0,active:0,errors:0,warnings:[],latestBlock:null,uptime:0};
 const started=Date.now();
 
-async function callToken(address,method,fallback=null){
-  try{return await new Contract(address,erc20,provider)[method]()}catch{return fallback}
-}
+async function callToken(address,method,fallback=null){try{return await new Contract(address,erc20,provider)[method]()}catch{return fallback}}
 async function tokenMeta(address){
   const key=address.toLowerCase();
   if(cache.has(key))return cache.get(key);
@@ -67,15 +64,19 @@ async function discoverPools(from,to){
           poolSet.add(('0x'+l.topics[2].slice(-40)).toLowerCase());
         }
       }
-    }catch(e){state.warnings.push(`${venue}: ${e.message}`)}
+    }catch(e){state.warnings=[...state.warnings.slice(-9),`${venue}: ${e.message}`]}
   }
 }
 async function transferLogs(from,to){
   const out=[];
-  for(let b=from;b<=to;b+=100){
-    const end=Math.min(to,b+99);
-    try{out.push(...await provider.getLogs({fromBlock:b,toBlock:end,topics:[TRANSFER_TOPIC]}))}
-    catch(e){state.warnings.push(`transfer scan ${b}-${end}: ${e.message}`)}
+  for(let b=from;b<=to;b+=20){
+    const end=Math.min(to,b+19);
+    try{
+      const batch=await provider.getLogs({fromBlock:b,toBlock:end,topics:[TRANSFER_TOPIC]});
+      out.push(...batch);
+      // Keep the in-memory working set bounded on busy blocks.
+      if(out.length>8000)out.splice(0,out.length-8000);
+    }catch(e){state.warnings=[...state.warnings.slice(-9),`transfer scan ${b}-${end}: ${e.message}`]}
   }
   return out;
 }
@@ -88,7 +89,7 @@ async function analyzeLogs(meta,logs){
       counterparties.add('0x'+l.topics[2].slice(26).toLowerCase());
     }
   }
-  for(const a of [...counterparties].filter(a=>a!==ZERO).slice(0,30)){
+  for(const a of [...counterparties].filter(a=>a!==ZERO).slice(0,20)){
     if(await isContract(a))poolSet.add(a);
   }
   const trades=[];
@@ -126,14 +127,15 @@ function scoreCandidate(meta,scout,trades){
 }
 async function scan(){
   const latest=await provider.getBlockNumber();
-  const from=Math.max(0,latest-900);
+  // Short rolling window keeps the free Render instance stable while still catching fresh activity.
+  const from=Math.max(0,latest-180);
   state.latestBlock=latest;
   await discoverPools(from,latest);
   const logs=await transferLogs(from,latest);
   const candidates=new Set();
   for(const l of logs){const a=l.address.toLowerCase();if(a!==WETH&&a!==ZERO)candidates.add(a)}
   const results=[];
-  for(const address of [...candidates].slice(0,120)){
+  for(const address of [...candidates].slice(0,60)){
     const meta=await tokenMeta(address);
     if(!meta.symbol||meta.symbol==='?')continue;
     const scout=await blockscoutToken(meta.address);
@@ -163,7 +165,7 @@ app.get('/api/token/:address',async(req,res)=>{
     const meta=await tokenMeta(address);
     const scout=await blockscoutToken(address);
     const latest=await provider.getBlockNumber();
-    const logs=await transferLogs(Math.max(0,latest-900),latest);
+    const logs=await transferLogs(Math.max(0,latest-180),latest);
     const trades=await analyzeLogs(meta,logs);
     const metrics=scoreCandidate(meta,scout,trades);
     res.json({...meta,...metrics,history:history.get(address.toLowerCase())||[]});
