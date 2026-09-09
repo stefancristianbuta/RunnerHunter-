@@ -107,7 +107,9 @@ function normalizePool(item, included) {
 }
 
 async function loadMarketPools(force = false) {
-  if (!force && Date.now() - geckoCache.at < 45000) return geckoCache.pools;
+  // Keep a valid market snapshot across transient GeckoTerminal 429/5xx responses.
+  // Never turn a temporary provider failure into an empty live radar.
+  if (!force && Date.now() - geckoCache.at < 45000 && geckoCache.pools.length) return geckoCache.pools;
   const all = [], warnings = [];
   const endpoints = [
     '/networks/robinhood/new_pools?include=base_token,quote_token,dex',
@@ -130,7 +132,14 @@ async function loadMarketPools(force = false) {
     const old = dedup.get(key);
     if (!old || p.volume.h1 + p.liquidity > old.volume.h1 + old.liquidity) dedup.set(key, p);
   }
-  geckoCache = { at: Date.now(), pools: [...dedup.values()] };
+  const freshPools = [...dedup.values()];
+  if (freshPools.length > 0) {
+    geckoCache = { at: Date.now(), pools: freshPools };
+  } else if (geckoCache.pools.length > 0) {
+    warnings.push('GeckoTerminal returned no usable pools; retaining last valid snapshot');
+  } else {
+    geckoCache = { at: Date.now(), pools: [] };
+  }
   if (warnings.length) state.warnings = [...state.warnings, ...warnings].slice(-10);
   return geckoCache.pools;
 }
@@ -168,8 +177,6 @@ function scorePool(p) {
 
 function passesFilter(m) {
   if (m.liquidity < 2500) return false;
-  // Do not kill the entire early-runner universe with a hard $5k MC floor.
-  // Reject only genuinely tiny MC relative to liquidity.
   if (m.marketCap > 0 && m.marketCap < Math.max(2500, m.liquidity * 0.35)) return false;
   if (m.buys + m.sells < 2) return false;
   if (m.volume1h < 25) return false;
@@ -246,5 +253,5 @@ app.get(/.*/, (req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')))
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`RunnerHunter listening on 0.0.0.0:${PORT}`);
   safeScan();
-  setInterval(safeScan, Number(process.env.SCAN_INTERVAL_MS || 30000));
+  setInterval(safeScan, 30000);
 });
