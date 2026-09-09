@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: runnerhunter
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: SCAN_INTERVAL_MS
+        value: "30000"
+      - key: RH_RPC_URL
+        sync: false
+      - key: BLOCKSCOUT_URL
+        value: https://robinhoodchain.blockscout.com/api/v2
