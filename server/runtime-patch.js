@@ -55,15 +55,18 @@ async function explorerFallback(address) {
     `${BS}/token/${address}`,
     `${ROBINSCAN}/token/${address}`
   ];
+  let zero = null;
   for (const url of urls) {
     try {
       const html = await fetchHtml(url);
       if (!html) continue;
       const holders = holderFromText(htmlToText(html));
-      if (holders != null) return { holders, source: url };
+      if (holders == null) continue;
+      if (holders > 0) return { holders, source: url };
+      zero = zero ?? { holders: 0, source: url };
     } catch {}
   }
-  return { holders: null, source: '' };
+  return zero || { holders: null, source: '' };
 }
 
 async function fallbackData(address) {
@@ -90,9 +93,9 @@ globalThis.fetch = async (input, init = {}) => {
       const known = counters
         ? finiteHolder(data?.token_holders_count)
         : finiteHolder(data?.holders_count ?? data?.holders ?? data?.holder_count ?? data?.token_holders_count);
-      if (known != null) return r;
+      if (known != null && known > 0) return r;
       const extra = await fallbackData(address);
-      if (extra.holders != null) {
+      if (extra.holders != null && extra.holders > 0) {
         const merged = counters
           ? { ...data, token_holders_count: String(extra.holders) }
           : { ...data, holders_count: String(extra.holders) };
@@ -110,4 +113,4 @@ globalThis.fetch = async (input, init = {}) => {
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
-console.log('[runtime-patch] Blockscout holder provider enabled: native -> Blockscout page -> Robinscan, logos untouched');
+console.log('[runtime-patch] Blockscout holder provider enabled: native -> Blockscout page -> Robinscan, positive fallback, logos untouched');
