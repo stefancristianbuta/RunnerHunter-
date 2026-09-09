@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.2.0",
   "type": "module",
-  "scripts": {"dev":"vite","build":"vite build","start":"node --import ./server/runtime-patch.js server/index.js","preview":"vite preview"},
+  "scripts": {"dev":"vite","build":"vite build","start":"node --import ./server/runtime-patch.js ./server/secure-entry.js","preview":"vite preview"},
   "dependencies": {"@vitejs/plugin-react":"latest","ethers":"latest","express":"latest","vite":"latest","react":"latest","react-dom":"latest"},
   "devDependencies": {}
 }
