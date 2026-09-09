@@ -1,6 +1,7 @@
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const BS = 'https://robinhoodchain.blockscout.com';
 const ROBINSCAN = 'https://robinscan.io';
+const ROBINHOOD_LOGO = 'https://cdn.robinhood.com/ncw_assets/logos';
 
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -41,6 +42,21 @@ function htmlToText(html) {
     .replace(/&#44;/g, ',');
 }
 
+function logoFromHtml(html) {
+  const source = String(html || '');
+  const patterns = [
+    /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
+    /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i
+  ];
+  for (const re of patterns) {
+    const m = source.match(re);
+    if (m?.[1] && /^https?:\/\//i.test(m[1])) return m[1];
+  }
+  return '';
+}
+
 async function fetchHtml(url) {
   const r = await nativeFetch(url, {
     headers: { accept: 'text/html,application/xhtml+xml' },
@@ -69,6 +85,23 @@ async function explorerFallback(address) {
   return zero || { holders: null, source: '' };
 }
 
+async function logoFallback(address) {
+  const lower = String(address).toLowerCase();
+  const robinhood = `${ROBINHOOD_LOGO}/${lower}.png`;
+  try {
+    const r = await nativeFetch(robinhood, { method: 'HEAD', signal: AbortSignal.timeout(3500) });
+    if (r.ok) return robinhood;
+  } catch {}
+  for (const url of [`${BS}/token/${address}`, `${ROBINSCAN}/token/${address}`]) {
+    try {
+      const html = await fetchHtml(url);
+      const image = logoFromHtml(html);
+      if (image) return image;
+    } catch {}
+  }
+  return '';
+}
+
 async function fallbackData(address) {
   const extra = await explorerFallback(address);
   if (extra.holders != null) {
@@ -93,14 +126,24 @@ globalThis.fetch = async (input, init = {}) => {
       const known = counters
         ? finiteHolder(data?.token_holders_count)
         : finiteHolder(data?.holders_count ?? data?.holders ?? data?.holder_count ?? data?.token_holders_count);
-      if (known != null && known > 0) return r;
-      const extra = await fallbackData(address);
-      if (extra.holders != null && extra.holders > 0) {
+      const existingImage = !counters && (data?.icon_url || data?.image_url || data?.metadata?.logo || data?.metadata?.image || data?.metadata?.image_url);
+      let extra = null;
+      if (known == null || known === 0) extra = await fallbackData(address);
+      if (!counters && !existingImage) {
+        const image = await logoFallback(address);
+        if (image) {
+          data.icon_url = image;
+          data.image_url = image;
+        }
+      }
+      if (known != null && known > 0 && (!extra || extra.holders == null) && !(!counters && !existingImage)) return r;
+      if (extra?.holders != null && extra.holders > 0) {
         const merged = counters
           ? { ...data, token_holders_count: String(extra.holders) }
           : { ...data, holders_count: String(extra.holders) };
         return jsonResponse(merged);
       }
+      if (!counters && (data.icon_url || data.image_url)) return jsonResponse(data);
       return r;
     }
   } catch (e) {
@@ -109,8 +152,11 @@ globalThis.fetch = async (input, init = {}) => {
 
   const extra = await fallbackData(address);
   if (counters && extra.holders != null) return jsonResponse({ token_holders_count: String(extra.holders) });
-  if (!counters && extra.holders != null) return jsonResponse({ holders_count: String(extra.holders) });
+  if (!counters) {
+    const image = await logoFallback(address);
+    return jsonResponse({ holders_count: extra.holders == null ? undefined : String(extra.holders), icon_url: image, image_url: image });
+  }
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
-console.log('[runtime-patch] Blockscout holder provider enabled: native -> Blockscout page -> Robinscan, positive fallback, logos untouched');
+console.log('[runtime-patch] Blockscout holder + logo provider enabled: native -> Robinhood CDN -> Blockscout/Robinscan, logos preserved');
