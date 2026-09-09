@@ -1,1 +1,9 @@
-{"name":"runnerhunter","private":true,"version":"0.1.0","type":"module","scripts":{"dev":"vite","build":"vite build","preview":"vite preview"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","react":"latest","react-dom":"latest"},"devDependencies":{}}
+{
+  "name": "runnerhunter",
+  "private": true,
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {"dev":"vite","build":"vite build","start":"node server/index.js","preview":"vite preview"},
+  "dependencies": {"@vitejs/plugin-react":"latest","ethers":"latest","express":"latest","vite":"latest","react":"latest","react-dom":"latest"},
+  "devDependencies": {}
+}
