@@ -65,9 +65,12 @@ async function fetchHtml(url) {
 }
 
 async function explorerFallback(address) {
+  // Robinscan's server-rendered token page exposes the current indexed holder
+  // total in plain text. Prefer it over generic Blockscout HTML, whose page
+  // contains unrelated numeric fields that can be mistaken for a holder count.
   const urls = [
-    `${BS}/token/${address}`,
-    `${ROBINSCAN}/token/${address}`
+    `${ROBINSCAN}/token/${address}`,
+    `${BS}/token/${address}`
   ];
   for (const url of urls) {
     try {
@@ -127,4 +130,4 @@ globalThis.fetch = async (input, init = {}) => {
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
-console.log('[runtime-patch] Blockscout holder provider enabled: native -> Blockscout page -> Robinscan');
+console.log('[runtime-patch] Blockscout holder provider enabled: native -> Robinscan -> Blockscout page');
