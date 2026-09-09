@@ -28,7 +28,7 @@ async function getSimWhale(token) {
   const configured = process.env.RH_SIM_WHALE || process.env.SCANHOOD_WHALE;
   if (configured) return configured;
   try {
-    const r = await fetch(\`${BLOCKSCOUT}/tokens/\${token}/holders?items_count=50\`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(5000) });
+    const r = await fetch(\`\${BLOCKSCOUT}/tokens/\${token}/holders?items_count=50\`, { headers: { accept: 'application/json' }, signal: AbortSignal.timeout(5000) });
     if (!r.ok) return null;
     const data = await r.json();
     for (const item of data?.items || []) {
