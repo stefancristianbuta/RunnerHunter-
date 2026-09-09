@@ -13,8 +13,7 @@ const provider = new JsonRpcProvider(RPC_URL, 4663, { staticNetwork: true });
 
 const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'.toLowerCase();
-const STABLE_SYMBOLS = new Set(['WETH', 'USDG', 'USDC', 'USDT', 'DAI', 'USDE']);
-
+const STABLE = new Set(['WETH', 'USDG', 'USDC', 'USDT', 'DAI', 'USDE']);
 const erc20 = new Interface([
   'function name() view returns (string)',
   'function symbol() view returns (string)',
@@ -28,35 +27,21 @@ const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
 let scanning = false;
-
+const started = Date.now();
 let state = {
   status: 'STARTING', lastUpdate: null, scanCycle: 0, discovered: 0,
   analyzed: 0, active: 0, errors: 0, warnings: [], latestBlock: null,
   uptime: 0, source: 'GeckoTerminal + Robinhood RPC'
 };
-const started = Date.now();
-
-async function callToken(address, method, fallback = null) {
-  try { return await new Contract(address, erc20, provider)[method](); }
-  catch { return fallback; }
-}
 
 async function tokenMeta(address) {
   const key = address.toLowerCase();
   if (metaCache.has(key)) return metaCache.get(key);
+  const call = async (method, fallback) => { try { return await new Contract(address, erc20, provider)[method](); } catch { return fallback; } };
   const [name, symbol, decimals, totalSupply] = await Promise.all([
-    callToken(address, 'name', 'Unknown'),
-    callToken(address, 'symbol', '?'),
-    callToken(address, 'decimals', 18),
-    callToken(address, 'totalSupply', 0n)
+    call('name', 'Unknown'), call('symbol', '?'), call('decimals', 18), call('totalSupply', 0n)
   ]);
-  const meta = {
-    address: getAddress(address),
-    name: String(name || 'Unknown'),
-    symbol: String(symbol || '?'),
-    decimals: Number(decimals || 18),
-    totalSupply: String(totalSupply || 0n)
-  };
+  const meta = { address: getAddress(address), name: String(name || 'Unknown'), symbol: String(symbol || '?'), decimals: Number(decimals || 18), totalSupply: String(totalSupply || 0n) };
   metaCache.set(key, meta);
   return meta;
 }
@@ -69,10 +54,7 @@ async function blockscoutToken(address) {
     const data = r.ok ? await r.json() : null;
     scoutCache.set(key, data);
     return data;
-  } catch {
-    scoutCache.set(key, null);
-    return null;
-  }
+  } catch { scoutCache.set(key, null); return null; }
 }
 
 async function gecko(pathname) {
@@ -94,8 +76,8 @@ function includedTokenMap(payload) {
   const map = new Map();
   for (const item of payload?.included || []) {
     if (item?.type !== 'token') continue;
-    const a = String(item.attributes?.address || addressFromResourceId(item.id) || '').toLowerCase();
-    if (a) map.set(String(item.id), { address: a, ...item.attributes });
+    const address = String(item.attributes?.address || addressFromResourceId(item.id) || '').toLowerCase();
+    if (address) map.set(String(item.id), { address, ...item.attributes });
   }
   return map;
 }
@@ -103,31 +85,22 @@ function includedTokenMap(payload) {
 function normalizePool(item, included) {
   const a = item?.attributes || {};
   const rel = item?.relationships || {};
-  const baseRef = rel.base_token?.data?.id;
-  const quoteRef = rel.quote_token?.data?.id;
-  const base = included.get(baseRef) || { address: addressFromResourceId(baseRef), symbol: '?', name: 'Unknown' };
-  const quote = included.get(quoteRef) || { address: addressFromResourceId(quoteRef), symbol: '?', name: 'Unknown' };
-  const token = !STABLE_SYMBOLS.has(String(base.symbol || '').toUpperCase()) ? base : quote;
+  const base = included.get(rel.base_token?.data?.id) || { address: addressFromResourceId(rel.base_token?.data?.id), symbol: '?', name: 'Unknown' };
+  const quote = included.get(rel.quote_token?.data?.id) || { address: addressFromResourceId(rel.quote_token?.data?.id), symbol: '?', name: 'Unknown' };
+  const baseStable = STABLE.has(String(base.symbol || '').toUpperCase()) || base.address === WETH || base.address === USDG;
+  const token = baseStable ? quote : base;
   if (!token?.address || token.address === WETH || token.address === USDG) return null;
   const tx = a.transactions || {};
-  const m5 = tx.m5 || {};
-  const h1 = tx.h1 || {};
-  const h6 = tx.h6 || {};
-  const h24 = tx.h24 || {};
   const pc = a.price_change_percentage || {};
   const vol = a.volume_usd || {};
   return {
-    pool: String(a.address || '').toLowerCase(),
-    dex: rel.dex?.data?.id || 'unknown',
-    token: token.address.toLowerCase(),
-    name: token.name || 'Unknown',
-    symbol: token.symbol || '?',
+    pool: String(a.address || '').toLowerCase(), dex: rel.dex?.data?.id || 'unknown',
+    token: token.address.toLowerCase(), name: token.name || 'Unknown', symbol: token.symbol || '?',
     price: Number(a.base_token_price_usd || a.token_price_usd || 0),
-    marketCap: Number(a.market_cap_usd || 0),
-    fdv: Number(a.fdv_usd || 0),
+    marketCap: Number(a.market_cap_usd || 0), fdv: Number(a.fdv_usd || 0),
     liquidity: Number(a.reserve_in_usd || 0),
     changes: { m5: Number(pc.m5 || 0), h1: Number(pc.h1 || 0), h6: Number(pc.h6 || 0), h24: Number(pc.h24 || 0) },
-    tx: { m5, h1, h6, h24 },
+    tx: { m5: tx.m5 || {}, h1: tx.h1 || {}, h6: tx.h6 || {}, h24: tx.h24 || {} },
     volume: { m5: Number(vol.m5 || 0), h1: Number(vol.h1 || 0), h6: Number(vol.h6 || 0), h24: Number(vol.h24 || 0) },
     createdAt: a.pool_created_at || null
   };
@@ -135,12 +108,13 @@ function normalizePool(item, included) {
 
 async function loadMarketPools(force = false) {
   if (!force && Date.now() - geckoCache.at < 45000) return geckoCache.pools;
-  const warnings = [];
-  const all = [];
-  for (const endpoint of [
+  const all = [], warnings = [];
+  const endpoints = [
     '/networks/robinhood/new_pools?include=base_token,quote_token,dex',
-    '/networks/robinhood/trending_pools?include=base_token,quote_token,dex'
-  ]) {
+    '/networks/robinhood/trending_pools?include=base_token,quote_token,dex',
+    '/networks/robinhood/pools?include=base_token,quote_token,dex'
+  ];
+  for (const endpoint of endpoints) {
     try {
       const payload = await gecko(endpoint);
       const included = includedTokenMap(payload);
@@ -148,72 +122,57 @@ async function loadMarketPools(force = false) {
         const p = normalizePool(item, included);
         if (p) all.push(p);
       }
-    } catch (e) {
-      warnings.push(e.message);
-    }
+    } catch (e) { warnings.push(e.message); }
   }
   const dedup = new Map();
   for (const p of all) {
     const key = `${p.token}:${p.pool}`;
-    if (!dedup.has(key)) dedup.set(key, p);
+    const old = dedup.get(key);
+    if (!old || p.volume.h1 + p.liquidity > old.volume.h1 + old.liquidity) dedup.set(key, p);
   }
   geckoCache = { at: Date.now(), pools: [...dedup.values()] };
   if (warnings.length) state.warnings = [...state.warnings, ...warnings].slice(-10);
   return geckoCache.pools;
 }
 
-function metricValue(x, key) { return Number(x?.[key] || 0); }
+const n = (x, k) => Number(x?.[k] || 0);
 
 function scorePool(p) {
-  const tx = p.tx || {};
-  const h1 = tx.h1 || {};
-  const h24 = tx.h24 || {};
-  const m5 = tx.m5 || {};
-  const buys = metricValue(h1, 'buys');
-  const sells = metricValue(h1, 'sells');
-  const buyers = metricValue(h1, 'buyers');
-  const sellers = metricValue(h1, 'sellers');
-  const totalTx = buys + sells;
-  const pressure = totalTx ? (buys / totalTx) * 100 : 50;
-  const volume = p.volume?.h1 || 0;
-  const liquidity = p.liquidity || 0;
-  const pc = p.changes || {};
-  const mcap = p.marketCap || p.fdv || 0;
-  const buyerQuality = Math.min(100, (buyers / Math.max(buys, 1)) * 100);
-  const sellerQuality = Math.min(100, (sellers / Math.max(sells, 1)) * 100);
+  const h1 = p.tx.h1, h24 = p.tx.h24, m5 = p.tx.m5;
+  const buys = n(h1, 'buys'), sells = n(h1, 'sells'), buyers = n(h1, 'buyers'), sellers = n(h1, 'sellers');
+  const total = buys + sells;
+  const pressure = total ? buys / total * 100 : 50;
   const participation = Math.min(100, Math.log10(Math.max(buyers + sellers, 1)) * 22);
-  const liquidityScore = Math.min(100, Math.log10(Math.max(liquidity, 1)) * 14);
-  const volumeLiquidity = Math.min(100, (volume / Math.max(liquidity, 1)) * 250);
-  const momentum = Math.max(0, Math.min(100,
-    35 + Number(pc.m5 || 0) * 1.5 + Number(pc.h1 || 0) * 0.55 + Number(pc.h6 || 0) * 0.12
-    + volumeLiquidity * 0.22 + participation * 0.18
-  ));
-  const balance = 100 - Math.min(100, Math.abs(buys - sells) / Math.max(totalTx, 1) * 100);
+  const liquidityScore = Math.min(100, Math.log10(Math.max(p.liquidity, 1)) * 14);
+  const volumeLiquidity = Math.min(100, p.volume.h1 / Math.max(p.liquidity, 1) * 250);
+  const momentum = Math.max(0, Math.min(100, 35 + p.changes.m5 * 1.5 + p.changes.h1 * 0.55 + p.changes.h6 * 0.12 + volumeLiquidity * 0.22 + participation * 0.18));
+  const balance = 100 - Math.min(100, Math.abs(buys - sells) / Math.max(total, 1) * 100);
   const organic = Math.round(
-    buyerQuality * 0.18 + sellerQuality * 0.12 + participation * 0.22
-    + liquidityScore * 0.20 + balance * 0.18 + Math.min(100, Math.log10(Math.max(metricValue(h24, 'buys') + metricValue(h24, 'sells'), 1)) * 15) * 0.10
+    Math.min(100, buyers / Math.max(buys, 1) * 100) * 0.18 +
+    Math.min(100, sellers / Math.max(sells, 1) * 100) * 0.12 +
+    participation * 0.22 + liquidityScore * 0.20 + balance * 0.18 +
+    Math.min(100, Math.log10(Math.max(n(h24, 'buys') + n(h24, 'sells'), 1)) * 15) * 0.10
   );
-  const acceleration = Math.max(0, Math.min(100,
-    45 + Number(pc.m5 || 0) * 2.2 + (metricValue(m5, 'buys') + metricValue(m5, 'sells')) * 2
-  ));
+  const acceleration = Math.max(0, Math.min(100, 45 + p.changes.m5 * 2.2 + (n(m5, 'buys') + n(m5, 'sells')) * 2));
   const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);
   let stage = score >= 82 ? 'RUNNING' : score >= 68 ? 'GROWING' : score >= 52 ? 'EARLY' : 'PULLBACK';
-  if (Number(pc.h1 || 0) < -8 && Number(pc.m5 || 0) < 0) stage = 'PULLBACK';
+  if (p.changes.h1 < -8 && p.changes.m5 < 0) stage = 'PULLBACK';
   return {
-    marketCap: mcap, price: p.price, liquidity, buys, sells,
-    buyers, sellers, buyValue: volume * pressure / 100, sellValue: volume * (100 - pressure) / 100,
-    pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score,
-    stage, volume1h: volume, volume24h: p.volume?.h24 || 0,
-    change5m: Number(pc.m5 || 0), change1h: Number(pc.h1 || 0), change6h: Number(pc.h6 || 0), change24h: Number(pc.h24 || 0),
-    age: p.createdAt
+    marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity,
+    buys, sells, buyers, sellers, buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100,
+    pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score, stage,
+    volume1h: p.volume.h1, volume24h: p.volume.h24,
+    change5m: p.changes.m5, change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24, age: p.createdAt
   };
 }
 
 function passesFilter(m) {
   if (m.liquidity < 2500) return false;
-  if (m.marketCap > 0 && m.marketCap < Math.max(5000, m.liquidity * 0.9)) return false;
-  if (m.buys + m.sells < 3) return false;
-  if (m.volume1h < 50) return false;
+  // Do not kill the entire early-runner universe with a hard $5k MC floor.
+  // Reject only genuinely tiny MC relative to liquidity.
+  if (m.marketCap > 0 && m.marketCap < Math.max(2500, m.liquidity * 0.35)) return false;
+  if (m.buys + m.sells < 2) return false;
+  if (m.volume1h < 25) return false;
   return true;
 }
 
@@ -222,28 +181,29 @@ async function scan() {
   const byToken = new Map();
   for (const p of pools) {
     const current = byToken.get(p.token);
-    if (!current || (p.volume.h1 + p.liquidity) > (current.volume.h1 + current.liquidity)) byToken.set(p.token, p);
+    if (!current || p.volume.h1 + p.liquidity > current.volume.h1 + current.liquidity) byToken.set(p.token, p);
   }
-  const candidates = [...byToken.values()];
+  const discovered = [...byToken.values()];
   const results = [];
-  for (const p of candidates.slice(0, 80)) {
+  for (const p of discovered.slice(0, 120)) {
     const m = scorePool(p);
     if (!passesFilter(m)) continue;
-    const meta = await tokenMeta(p.token);
-    if (!meta.symbol || meta.symbol === '?') continue;
-    const prev = history.get(p.token) || [];
-    history.set(p.token, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
-    results.push({ ...meta, ...m, pool: p.pool, dex: p.dex, history: history.get(p.token) });
+    const key = p.token.toLowerCase();
+    const prev = history.get(key) || [];
+    const nextHistory = [...prev, { ts: Date.now(), score: m.score }].slice(-24);
+    history.set(key, nextHistory);
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, ...m, pool: p.pool, dex: p.dex, history: nextHistory });
   }
   results.sort((a, b) => b.score - a.score);
-  const latest = await provider.getBlockNumber();
+  let latestBlock = null;
+  try { latestBlock = await provider.getBlockNumber(); } catch (e) { state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10); }
   state = {
     ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1,
-    discovered: candidates.length, analyzed: results.length, active: results.filter(x => x.score >= 52).length,
-    latestBlock: latest, uptime: Math.floor((Date.now() - started) / 1000), errors: 0,
-    warnings: state.warnings.slice(-10)
+    discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.score >= 52).length,
+    latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0
   };
   radar = results;
+  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} top=${results[0]?.symbol || 'none'}`);
 }
 
 async function safeScan() {
@@ -252,6 +212,7 @@ async function safeScan() {
   try { await scan(); }
   catch (e) {
     state = { ...state, status: 'DEGRADED', errors: state.errors + 1, warnings: [...state.warnings, e.message].slice(-10), uptime: Math.floor((Date.now() - started) / 1000) };
+    console.error(`[scan:error] ${e.message}`);
   }
   finally { scanning = false; }
 }
@@ -261,6 +222,7 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
 app.get('/api/status', (req, res) => res.json(state));
 app.get('/api/radar', (req, res) => res.json(radar));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
 app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
@@ -269,15 +231,12 @@ app.get('/api/token/:address', async (req, res) => {
     const pools = await gecko(`/networks/robinhood/tokens/${address}/pools?include=base_token,quote_token,dex`);
     const included = includedTokenMap(pools);
     const normalized = (pools?.data || []).map(x => normalizePool(x, included)).filter(Boolean).slice(0, 10);
-    if (!normalized.length) {
-      const marketCap = Number(scout?.market_cap || scout?.circulating_market_cap || 0);
-      return res.json({ ...meta, marketCap, score: 0, organic: 0, momentum: 0, stage: 'EARLY', history: history.get(address.toLowerCase()) || [] });
-    }
-    const best = normalized.sort((a, b) => (b.volume.h1 + b.liquidity) - (a.volume.h1 + a.liquidity))[0];
+    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), score: 0, organic: 0, momentum: 0, stage: 'EARLY', history: history.get(address.toLowerCase()) || [] });
+    const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
     const metrics = scorePool(best);
-    const prev = history.get(address.toLowerCase()) || [];
-    history.set(address.toLowerCase(), [...prev, { ts: Date.now(), score: metrics.score }].slice(-24));
-    res.json({ ...meta, ...metrics, pool: best.pool, dex: best.dex, history: history.get(address.toLowerCase()) });
+    const key = address.toLowerCase();
+    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score }].slice(-24));
+    res.json({ ...meta, ...metrics, pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpc: process.env.RH_RPC_URL ? 'configured' : 'public fallback', publicFallback: !process.env.RH_RPC_URL, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
