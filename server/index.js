@@ -36,6 +36,7 @@ const scoutCache = new Map();
 const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
+const geckoSources = new Map();
 let geckoRefreshIndex = 0;
 let geckoRefreshInFlight = false;
 let scanning = false;
@@ -231,6 +232,12 @@ function normalizePool(item, included) {
   };
 }
 
+const GECKO_ENDPOINTS = [
+  { key: 'new', path: '/networks/robinhood/new_pools?include=base_token,quote_token,dex', minAge: 20000 },
+  { key: 'trending', path: '/networks/robinhood/trending_pools?include=base_token,quote_token,dex', minAge: 60000 },
+  { key: 'pools', path: '/networks/robinhood/pools?include=base_token,quote_token,dex', minAge: 90000 }
+];
+
 function mergePools(existing, incoming) {
   const map = new Map(existing.map(p => [`${p.token}:${p.pool}`, p]));
   for (const p of incoming) {
@@ -241,47 +248,62 @@ function mergePools(existing, incoming) {
   return [...map.values()];
 }
 
-async function refreshGeckoEndpoint(endpoint) {
-  const payload = await gecko(endpoint);
+async function refreshGeckoEndpoint(source) {
+  const payload = await gecko(source.path);
   const included = includedTokenMap(payload);
   const incoming = [];
   for (const item of payload?.data || []) {
     const p = normalizePool(item, included);
     if (p) incoming.push(p);
   }
+  geckoSources.set(source.key, { at: Date.now(), pools: incoming });
   return incoming;
 }
 
-async function refreshGeckoIncremental() {
-  if (geckoRefreshInFlight) return;
-  if (Date.now() < geckoBlockedUntil) return;
+function rebuildGeckoCache() {
+  let merged = [];
+  for (const source of GECKO_ENDPOINTS) {
+    const cached = geckoSources.get(source.key);
+    if (cached?.pools?.length) merged = mergePools(merged, cached.pools);
+  }
+  if (merged.length) geckoCache = { at: Date.now(), pools: merged };
+  return geckoCache.pools;
+}
+
+function pickGeckoSource(force = false) {
+  const now = Date.now();
+  const due = GECKO_ENDPOINTS.filter(source => {
+    const cached = geckoSources.get(source.key);
+    return force || !cached || now - cached.at >= source.minAge;
+  });
+  if (!due.length) return null;
+  // New pools get priority; the others rotate so no endpoint is hammered.
+  if (due.some(x => x.key === 'new')) return GECKO_ENDPOINTS.find(x => x.key === 'new');
+  return due[geckoRefreshIndex++ % due.length];
+}
+
+async function refreshGeckoIncremental(force = false) {
+  if (geckoRefreshInFlight || Date.now() < geckoBlockedUntil) return;
+  const source = pickGeckoSource(force);
+  if (!source) return;
   geckoRefreshInFlight = true;
   try {
-    const endpoints = [
-      '/networks/robinhood/new_pools?include=base_token,quote_token,dex',
-      '/networks/robinhood/trending_pools?include=base_token,quote_token,dex',
-      '/networks/robinhood/pools?include=base_token,quote_token,dex'
-    ];
-    const endpoint = endpoints[geckoRefreshIndex % endpoints.length];
-    geckoRefreshIndex = (geckoRefreshIndex + 1) % endpoints.length;
-    try {
-      const incoming = await refreshGeckoEndpoint(endpoint);
-      if (incoming.length) geckoCache = { at: Date.now(), pools: mergePools(geckoCache.pools, incoming) };
-      else if (!geckoCache.pools.length) geckoCache = { at: Date.now(), pools: [] };
-    } catch (e) {
-      state.warnings = [...state.warnings, e.message].slice(-10);
-    }
+    await refreshGeckoEndpoint(source);
+    rebuildGeckoCache();
+  } catch (e) {
+    state.warnings = [...state.warnings, e.message].slice(-10);
   } finally {
     geckoRefreshInFlight = false;
   }
 }
 
 async function loadMarketPools(force = false) {
-  if (!force && geckoCache.pools.length && Date.now() - geckoCache.at < 90000) {
-    void refreshGeckoIncremental();
+  if (!geckoCache.pools.length) {
+    await refreshGeckoIncremental(true);
     return geckoCache.pools;
   }
-  await refreshGeckoIncremental();
+  // Never block a live scan for market-data refreshes. Return the last good snapshot immediately.
+  void refreshGeckoIncremental(force);
   return geckoCache.pools;
 }
 
@@ -328,9 +350,11 @@ async function scan() {
     if (!passesFilter(m)) continue;
     const key = p.token.toLowerCase();
     const prev = history.get(key) || [];
-    const nextHistory = [...prev, { ts: Date.now(), score: m.score }].slice(-24);
-    history.set(key, nextHistory);
-    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, ...m, pool: p.pool, dex: p.dex, history: nextHistory });
+    const last = prev[prev.length - 1];
+    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score) {
+      history.set(key, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
+    }
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, ...m, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
@@ -356,7 +380,7 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
 app.get('/api/status', (req, res) => res.json(state));
 app.get('/api/radar', (req, res) => res.json(radar));
-app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshIndex, geckoRefreshInFlight, warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshIndex, geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
 app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
