@@ -15,7 +15,6 @@ const RPC_URLS = [...new Set([
 const BLOCKSCOUT = process.env.BLOCKSCOUT_URL || 'https://robinhoodchain.blockscout.com/api/v2';
 const GECKO = 'https://api.geckoterminal.com/api/v2';
 const providers = RPC_URLS.map(url => new JsonRpcProvider(url, 4663, { staticNetwork: true }));
-const provider = providers[0];
 
 const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'.toLowerCase();
@@ -37,7 +36,6 @@ const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
 const geckoSources = new Map();
-let geckoRefreshIndex = 0;
 let geckoRefreshInFlight = false;
 let scanning = false;
 let enriching = false;
@@ -69,10 +67,7 @@ async function multicall(calls) {
 async function tokenMeta(address) {
   const key = address.toLowerCase();
   if (metaCache.has(key)) return metaCache.get(key);
-  let name = 'Unknown';
-  let symbol = '?';
-  let decimals = 18;
-  let totalSupply = 0n;
+  let name = 'Unknown', symbol = '?', decimals = 18, totalSupply = 0n;
   try {
     const methods = ['name', 'symbol', 'decimals', 'totalSupply'];
     const calls = methods.map(method => ({ target: address, allowFailure: true, callData: erc20.encodeFunctionData(method) }));
@@ -89,15 +84,8 @@ async function tokenMeta(address) {
     decimals = decode(2, 'decimals', 18);
     totalSupply = decode(3, 'totalSupply', 0n);
   } catch {
-    const call = async (method, fallback) => {
-      try { return await withRpc((p) => p.call({ to: address, data: erc20.encodeFunctionData(method) })); }
-      catch { return fallback; }
-    };
-    const decodeFallback = async (method, fallback) => {
-      const raw = await call(method, null);
-      if (raw == null) return fallback;
-      try { return erc20.decodeFunctionResult(method, raw)[0]; } catch { return fallback; }
-    };
+    const call = async method => { try { return await withRpc(p => p.call({ to: address, data: erc20.encodeFunctionData(method) })); } catch { return null; } };
+    const decodeFallback = async (method, fallback) => { const raw = await call(method); if (raw == null) return fallback; try { return erc20.decodeFunctionResult(method, raw)[0]; } catch { return fallback; } };
     [name, symbol, decimals, totalSupply] = await Promise.all([
       decodeFallback('name', 'Unknown'), decodeFallback('symbol', '?'), decodeFallback('decimals', 18), decodeFallback('totalSupply', 0n)
     ]);
@@ -108,11 +96,8 @@ async function tokenMeta(address) {
 }
 
 async function latestBlockNumber() {
-  try { return await withRpc((p) => p.getBlockNumber()); }
-  catch (e) {
-    state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10);
-    return null;
-  }
+  try { return await withRpc(p => p.getBlockNumber()); }
+  catch (e) { state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10); return null; }
 }
 
 async function blockscoutToken(address) {
@@ -126,15 +111,24 @@ async function blockscoutToken(address) {
     scoutCache.set(key, { at: Date.now(), data });
     return data;
   } catch (e) {
+    state.warnings = [...state.warnings, `Blockscout ${address}: ${e.message}`].slice(-10);
     if (cached) return cached.data;
     scoutCache.set(key, { at: Date.now(), data: null });
     return null;
   }
 }
 
+async function blockscoutCounters(address) {
+  try {
+    const r = await fetch(`${BLOCKSCOUT}/tokens/${address}/counters`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
 function scoutInfo(scout) {
   if (!scout) return { holders: null, image: '' };
-  const rawHolders = scout.holders ?? scout.holder_count ?? scout.holders_count ?? scout.token_holders_count;
+  const rawHolders = scout.holders_count ?? scout.holders ?? scout.holder_count ?? scout.token_holders_count;
   const holders = rawHolders == null ? null : Number(rawHolders);
   const image = scout.icon_url || scout.image_url || scout.metadata?.logo || scout.metadata?.image || '';
   return { holders: Number.isFinite(holders) && holders >= 0 ? holders : null, image: typeof image === 'string' ? image : '' };
@@ -146,39 +140,38 @@ async function enrichRadar(results) {
   try {
     const targets = results.slice(0, 30);
     let cursor = 0;
-    const workers = Array.from({ length: Math.min(8, targets.length) }, async () => {
+    const workers = Array.from({ length: Math.min(4, targets.length) }, async () => {
       while (cursor < targets.length) {
         const item = targets[cursor++];
         const scout = await blockscoutToken(item.address);
         const info = scoutInfo(scout);
+        let holders = info.holders;
+        if (holders == null) {
+          const counters = await blockscoutCounters(item.address);
+          const n = Number(counters?.token_holders_count);
+          if (Number.isFinite(n)) holders = n;
+        }
         const current = radar.find(x => x.address.toLowerCase() === item.address.toLowerCase()) || item;
-        current.holders = info.holders;
-        current.image = info.image;
+        current.holders = holders;
+        current.image = info.image || current.image || '';
       }
     });
     await Promise.all(workers);
-  } finally {
-    enriching = false;
-  }
+  } finally { enriching = false; }
 }
 
 let geckoNextAllowedAt = 0;
 let geckoBlockedUntil = 0;
 let geckoQueue = Promise.resolve();
-
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function gecko(pathname) {
   const run = async () => {
-    const now = Date.now();
-    if (now < geckoBlockedUntil) throw new Error('GeckoTerminal rate-limit cooldown');
+    if (Date.now() < geckoBlockedUntil) throw new Error('GeckoTerminal rate-limit cooldown');
     const delay = Math.max(0, geckoNextAllowedAt - Date.now());
     if (delay) await wait(delay);
     geckoNextAllowedAt = Date.now() + 6500;
-    const r = await fetch(`${GECKO}${pathname}`, {
-      headers: { accept: 'application/json;version=20230203' },
-      signal: AbortSignal.timeout(8000)
-    });
+    const r = await fetch(`${GECKO}${pathname}`, { headers: { accept: 'application/json;version=20230203' }, signal: AbortSignal.timeout(8000) });
     if (r.status === 429) {
       const retry = Number(r.headers.get('retry-after') || 60);
       geckoBlockedUntil = Date.now() + Math.max(60, retry) * 1000;
@@ -216,15 +209,12 @@ function normalizePool(item, included) {
   const baseStable = STABLE.has(String(base.symbol || '').toUpperCase()) || base.address === WETH || base.address === USDG;
   const token = baseStable ? quote : base;
   if (!token?.address || token.address === WETH || token.address === USDG) return null;
-  const tx = a.transactions || {};
-  const pc = a.price_change_percentage || {};
-  const vol = a.volume_usd || {};
+  const tx = a.transactions || {}, pc = a.price_change_percentage || {}, vol = a.volume_usd || {};
   return {
     pool: String(a.address || '').toLowerCase(), dex: rel.dex?.data?.id || 'unknown',
     token: token.address.toLowerCase(), name: token.name || 'Unknown', symbol: token.symbol || '?',
-    price: Number(a.base_token_price_usd || a.token_price_usd || 0),
-    marketCap: Number(a.market_cap_usd || 0), fdv: Number(a.fdv_usd || 0),
-    liquidity: Number(a.reserve_in_usd || 0),
+    image: token.image_url || '', price: Number(a.base_token_price_usd || a.token_price_usd || 0),
+    marketCap: Number(a.market_cap_usd || 0), fdv: Number(a.fdv_usd || 0), liquidity: Number(a.reserve_in_usd || 0),
     changes: { m5: Number(pc.m5 || 0), h1: Number(pc.h1 || 0), h6: Number(pc.h6 || 0), h24: Number(pc.h24 || 0) },
     tx: { m5: tx.m5 || {}, h1: tx.h1 || {}, h6: tx.h6 || {}, h24: tx.h24 || {} },
     volume: { m5: Number(vol.m5 || 0), h1: Number(vol.h1 || 0), h6: Number(vol.h6 || 0), h24: Number(vol.h24 || 0) },
@@ -233,9 +223,12 @@ function normalizePool(item, included) {
 }
 
 const GECKO_ENDPOINTS = [
-  { key: 'new', path: '/networks/robinhood/new_pools?include=base_token,quote_token,dex', minAge: 20000 },
-  { key: 'trending', path: '/networks/robinhood/trending_pools?include=base_token,quote_token,dex', minAge: 60000 },
-  { key: 'pools', path: '/networks/robinhood/pools?include=base_token,quote_token,dex', minAge: 90000 }
+  { key: 'new-1', path: '/networks/robinhood/new_pools?page=1&include=base_token,quote_token,dex', minAge: 20000 },
+  { key: 'new-2', path: '/networks/robinhood/new_pools?page=2&include=base_token,quote_token,dex', minAge: 45000 },
+  { key: 'trending-1', path: '/networks/robinhood/trending_pools?page=1&include=base_token,quote_token,dex', minAge: 60000 },
+  { key: 'trending-2', path: '/networks/robinhood/trending_pools?page=2&include=base_token,quote_token,dex', minAge: 120000 },
+  { key: 'pools-1', path: '/networks/robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 90000 },
+  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }
 ];
 
 function mergePools(existing, incoming) {
@@ -277,9 +270,12 @@ function pickGeckoSource(force = false) {
     return force || !cached || now - cached.at >= source.minAge;
   });
   if (!due.length) return null;
-  // New pools get priority; the others rotate so no endpoint is hammered.
-  if (due.some(x => x.key === 'new')) return GECKO_ENDPOINTS.find(x => x.key === 'new');
-  return due[geckoRefreshIndex++ % due.length];
+  return due.sort((a, b) => {
+    const ca = geckoSources.get(a.key), cb = geckoSources.get(b.key);
+    const aa = ca ? now - ca.at - a.minAge : Number.MAX_SAFE_INTEGER;
+    const ab = cb ? now - cb.at - b.minAge : Number.MAX_SAFE_INTEGER;
+    return ab - aa;
+  })[0];
 }
 
 async function refreshGeckoIncremental(force = false) {
@@ -287,14 +283,9 @@ async function refreshGeckoIncremental(force = false) {
   const source = pickGeckoSource(force);
   if (!source) return;
   geckoRefreshInFlight = true;
-  try {
-    await refreshGeckoEndpoint(source);
-    rebuildGeckoCache();
-  } catch (e) {
-    state.warnings = [...state.warnings, e.message].slice(-10);
-  } finally {
-    geckoRefreshInFlight = false;
-  }
+  try { await refreshGeckoEndpoint(source); rebuildGeckoCache(); }
+  catch (e) { state.warnings = [...state.warnings, e.message].slice(-10); }
+  finally { geckoRefreshInFlight = false; }
 }
 
 async function loadMarketPools(force = false) {
@@ -302,13 +293,11 @@ async function loadMarketPools(force = false) {
     await refreshGeckoIncremental(true);
     return geckoCache.pools;
   }
-  // Never block a live scan for market-data refreshes. Return the last good snapshot immediately.
   void refreshGeckoIncremental(force);
   return geckoCache.pools;
 }
 
 const n = (x, k) => Number(x?.[k] || 0);
-
 function scorePool(p) {
   const h1 = p.tx.h1, h24 = p.tx.h24, m5 = p.tx.m5;
   const buys = n(h1, 'buys'), sells = n(h1, 'sells'), buyers = n(h1, 'buyers'), sellers = n(h1, 'sellers');
@@ -351,10 +340,8 @@ async function scan() {
     const key = p.token.toLowerCase();
     const prev = history.get(key) || [];
     const last = prev[prev.length - 1];
-    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score) {
-      history.set(key, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
-    }
-    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, ...m, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
+    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score) history.set(key, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...m, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
@@ -380,24 +367,30 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
 app.get('/api/status', (req, res) => res.json(state));
 app.get('/api/radar', (req, res) => res.json(radar));
-app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshIndex, geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
 app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
     const meta = await tokenMeta(address);
     const scout = await blockscoutToken(address);
     const info = scoutInfo(scout);
+    let holders = info.holders;
+    if (holders == null) {
+      const counters = await blockscoutCounters(address);
+      const n = Number(counters?.token_holders_count);
+      if (Number.isFinite(n)) holders = n;
+    }
     const cachedRadar = radar.find(x => x.address.toLowerCase() === address.toLowerCase());
-    if (cachedRadar && cachedRadar.pool) return res.json({ ...meta, ...cachedRadar, holders: info.holders ?? cachedRadar.holders ?? null, image: info.image || cachedRadar.image || '' });
+    if (cachedRadar && cachedRadar.pool) return res.json({ ...meta, ...cachedRadar, holders: holders ?? cachedRadar.holders ?? null, image: info.image || cachedRadar.image || '' });
     let pools = null;
     try { pools = await gecko(`/networks/robinhood/tokens/${address}/pools?include=base_token,quote_token,dex`); } catch { pools = null; }
     const normalized = pools ? (pools?.data || []).map(x => normalizePool(x, includedTokenMap(pools))).filter(Boolean).slice(0, 10) : [];
-    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders: info.holders, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'EARLY', history: history.get(address.toLowerCase()) || [] });
+    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'EARLY', history: history.get(address.toLowerCase()) || [] });
     const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
     const metrics = scorePool(best);
     const key = address.toLowerCase();
     history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score }].slice(-24));
-    res.json({ ...meta, ...metrics, holders: info.holders, image: info.image, pool: best.pool, dex: best.dex, history: history.get(key) });
+    res.json({ ...meta, ...metrics, holders, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), multicall3: MULTICALL3, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
