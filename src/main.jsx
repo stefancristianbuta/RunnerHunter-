@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './styles.css';
 
@@ -7,7 +7,8 @@ const short=a=>a?`${a.slice(0,8)}…${a.slice(-6)}`:'';
 const money=n=>{const v=Number(n||0);if(!v)return'—';if(v>=1e9)return`$${(v/1e9).toFixed(2)}B`;if(v>=1e6)return`$${(v/1e6).toFixed(2)}M`;if(v>=1e3)return`$${(v/1e3).toFixed(1)}K`;return`$${v.toFixed(0)}`};
 const initials=s=>(s||'?').slice(0,2).toUpperCase();
 const logoCache=new Map();
-function TokenLogo({token,big=false}){const[address]=useState(token?.address?.toLowerCase()||'');const[img,setImg]=useState(()=>token?.image||logoCache.get(address)||'');useEffect(()=>{let live=true;if(token?.image){logoCache.set(address,token.image);setImg(token.image);return()=>{live=false}}return()=>{live=false}},[token?.image,address]);return <div className={`coin ${big?'big':''}`}>{img?<img src={img} alt="" loading="lazy" decoding="async" onError={()=>{logoCache.delete(address);setImg('')}}/>:<span>{initials(token?.symbol||token?.name)}</span>}</div>}
+function imageUrl(src){const s=String(src||'').trim();if(!s)return'';if(s.startsWith('ipfs://'))return`https://ipfs.io/ipfs/${s.slice(7).replace(/^ipfs\//,'')}`;if(s.startsWith('ipfs/'))return`https://ipfs.io/${s}`;if(s.startsWith('ar://'))return`https://arweave.net/${s.slice(5)}`;return s}
+function TokenLogo({token,big=false}){const[address]=useState(token?.address?.toLowerCase()||'');const normalized=imageUrl(token?.image||logoCache.get(address)||'');const[img,setImg]=useState(normalized);useEffect(()=>{const next=imageUrl(token?.image||'');if(next){logoCache.set(address,next);setImg(next)}},[token?.image,address]);return <div className={`coin ${big?'big':''}`}>{img?<img src={img} alt="" loading="lazy" decoding="async" onError={()=>{logoCache.delete(address);setImg('')}}/>:<span>{initials(token?.symbol||token?.name)}</span>}</div>}
 function HunterLogo(){return <div className="hunterLogo"><span>⌁</span></div>}
 function App(){const[tab,setTab]=useState('EARLY'),[page,setPage]=useState('radar'),[selected,setSelected]=useState(null),[favorites,setFavorites]=useState(()=>JSON.parse(localStorage.getItem('rh-favs')||'[]')),[query,setQuery]=useState(''),[radar,setRadar]=useState([]),[status,setStatus]=useState({status:'STARTING'}),[notice,setNotice]=useState('');
 async function load(){try{const[r,s]=await Promise.all([fetch(`${API}/radar`),fetch(`${API}/status`)]);setRadar(await r.json());setStatus(await s.json())}catch{setNotice('Engine offline')}}
