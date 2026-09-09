@@ -36,6 +36,8 @@ const scoutCache = new Map();
 const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
+let geckoRefreshIndex = 0;
+let geckoRefreshInFlight = false;
 let scanning = false;
 let enriching = false;
 const started = Date.now();
@@ -66,19 +68,13 @@ async function multicall(calls) {
 async function tokenMeta(address) {
   const key = address.toLowerCase();
   if (metaCache.has(key)) return metaCache.get(key);
-
   let name = 'Unknown';
   let symbol = '?';
   let decimals = 18;
   let totalSupply = 0n;
-
   try {
     const methods = ['name', 'symbol', 'decimals', 'totalSupply'];
-    const calls = methods.map(method => ({
-      target: address,
-      allowFailure: true,
-      callData: erc20.encodeFunctionData(method)
-    }));
+    const calls = methods.map(method => ({ target: address, allowFailure: true, callData: erc20.encodeFunctionData(method) }));
     const results = await multicall(calls);
     const decode = (index, method, fallback) => {
       try {
@@ -93,9 +89,8 @@ async function tokenMeta(address) {
     totalSupply = decode(3, 'totalSupply', 0n);
   } catch {
     const call = async (method, fallback) => {
-      try {
-        return await withRpc((p) => p.call({ to: address, data: erc20.encodeFunctionData(method) }));
-      } catch { return fallback; }
+      try { return await withRpc((p) => p.call({ to: address, data: erc20.encodeFunctionData(method) })); }
+      catch { return fallback; }
     };
     const decodeFallback = async (method, fallback) => {
       const raw = await call(method, null);
@@ -103,13 +98,9 @@ async function tokenMeta(address) {
       try { return erc20.decodeFunctionResult(method, raw)[0]; } catch { return fallback; }
     };
     [name, symbol, decimals, totalSupply] = await Promise.all([
-      decodeFallback('name', 'Unknown'),
-      decodeFallback('symbol', '?'),
-      decodeFallback('decimals', 18),
-      decodeFallback('totalSupply', 0n)
+      decodeFallback('name', 'Unknown'), decodeFallback('symbol', '?'), decodeFallback('decimals', 18), decodeFallback('totalSupply', 0n)
     ]);
   }
-
   const meta = { address: getAddress(address), name: String(name || 'Unknown'), symbol: String(symbol || '?'), decimals: Number(decimals || 18), totalSupply: String(totalSupply || 0n) };
   metaCache.set(key, meta);
   return meta;
@@ -240,39 +231,57 @@ function normalizePool(item, included) {
   };
 }
 
-async function loadMarketPools(force = false) {
-  if (!force && Date.now() - geckoCache.at < 45000 && geckoCache.pools.length) return geckoCache.pools;
-  if (Date.now() < geckoBlockedUntil && geckoCache.pools.length) return geckoCache.pools;
-  const all = [], warnings = [];
-  const endpoints = [
-    '/networks/robinhood/new_pools?include=base_token,quote_token,dex',
-    '/networks/robinhood/trending_pools?include=base_token,quote_token,dex',
-    '/networks/robinhood/pools?include=base_token,quote_token,dex'
-  ];
-  for (const endpoint of endpoints) {
-    try {
-      const payload = await gecko(endpoint);
-      const included = includedTokenMap(payload);
-      for (const item of payload?.data || []) {
-        const p = normalizePool(item, included);
-        if (p) all.push(p);
-      }
-    } catch (e) {
-      warnings.push(e.message);
-      if (String(e.message).includes('cooldown')) break;
-    }
-  }
-  const dedup = new Map();
-  for (const p of all) {
+function mergePools(existing, incoming) {
+  const map = new Map(existing.map(p => [`${p.token}:${p.pool}`, p]));
+  for (const p of incoming) {
     const key = `${p.token}:${p.pool}`;
-    const old = dedup.get(key);
-    if (!old || p.volume.h1 + p.liquidity > old.volume.h1 + old.liquidity) dedup.set(key, p);
+    const old = map.get(key);
+    if (!old || p.volume.h1 + p.liquidity >= old.volume.h1 + old.liquidity) map.set(key, p);
   }
-  const freshPools = [...dedup.values()];
-  if (freshPools.length > 0) geckoCache = { at: Date.now(), pools: freshPools };
-  else if (geckoCache.pools.length > 0) warnings.push('GeckoTerminal unavailable; retaining last valid snapshot');
-  else geckoCache = { at: Date.now(), pools: [] };
-  if (warnings.length) state.warnings = [...state.warnings, ...warnings].slice(-10);
+  return [...map.values()];
+}
+
+async function refreshGeckoEndpoint(endpoint) {
+  const payload = await gecko(endpoint);
+  const included = includedTokenMap(payload);
+  const incoming = [];
+  for (const item of payload?.data || []) {
+    const p = normalizePool(item, included);
+    if (p) incoming.push(p);
+  }
+  return incoming;
+}
+
+async function refreshGeckoIncremental() {
+  if (geckoRefreshInFlight) return;
+  if (Date.now() < geckoBlockedUntil) return;
+  geckoRefreshInFlight = true;
+  try {
+    const endpoints = [
+      '/networks/robinhood/new_pools?include=base_token,quote_token,dex',
+      '/networks/robinhood/trending_pools?include=base_token,quote_token,dex',
+      '/networks/robinhood/pools?include=base_token,quote_token,dex'
+    ];
+    const endpoint = endpoints[geckoRefreshIndex % endpoints.length];
+    geckoRefreshIndex = (geckoRefreshIndex + 1) % endpoints.length;
+    try {
+      const incoming = await refreshGeckoEndpoint(endpoint);
+      if (incoming.length) geckoCache = { at: Date.now(), pools: mergePools(geckoCache.pools, incoming) };
+      else if (!geckoCache.pools.length) geckoCache = { at: Date.now(), pools: [] };
+    } catch (e) {
+      state.warnings = [...state.warnings, e.message].slice(-10);
+    }
+  } finally {
+    geckoRefreshInFlight = false;
+  }
+}
+
+async function loadMarketPools(force = false) {
+  if (!force && geckoCache.pools.length && Date.now() - geckoCache.at < 90000) {
+    void refreshGeckoIncremental();
+    return geckoCache.pools;
+  }
+  await refreshGeckoIncremental();
   return geckoCache.pools;
 }
 
@@ -347,7 +356,7 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
 app.get('/api/status', (req, res) => res.json(state));
 app.get('/api/radar', (req, res) => res.json(radar));
-app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshIndex, geckoRefreshInFlight, warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
 app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
@@ -367,7 +376,7 @@ app.get('/api/token/:address', async (req, res) => {
     res.json({ ...meta, ...metrics, holders: info.holders, image: info.image, pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, multicall3: MULTICALL3, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
+app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), multicall3: MULTICALL3, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
 app.use(express.static(path.join(ROOT, 'dist')));
 app.get(/.*/, (req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
 
