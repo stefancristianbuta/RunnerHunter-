@@ -41,20 +41,6 @@ function htmlToText(html) {
     .replace(/&#44;/g, ',');
 }
 
-function imageFromHtml(html) {
-  const patterns = [
-    /property=["']og:image["'][^>]+content=["']([^"']+)/i,
-    /content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
-    /"icon_url"\s*:\s*"([^"]+)/i,
-    /"image_url"\s*:\s*"([^"]+)/i
-  ];
-  for (const re of patterns) {
-    const m = String(html || '').match(re);
-    if (m?.[1]) return m[1].replace(/\\\//g, '/');
-  }
-  return '';
-}
-
 async function fetchHtml(url) {
   const r = await nativeFetch(url, {
     headers: { accept: 'text/html,application/xhtml+xml' },
@@ -65,29 +51,25 @@ async function fetchHtml(url) {
 }
 
 async function explorerFallback(address) {
-  // Robinscan's server-rendered token page exposes the current indexed holder
-  // total in plain text. Prefer it over generic Blockscout HTML, whose page
-  // contains unrelated numeric fields that can be mistaken for a holder count.
   const urls = [
-    `${ROBINSCAN}/token/${address}`,
-    `${BS}/token/${address}`
+    `${BS}/token/${address}`,
+    `${ROBINSCAN}/token/${address}`
   ];
   for (const url of urls) {
     try {
       const html = await fetchHtml(url);
       if (!html) continue;
       const holders = holderFromText(htmlToText(html));
-      const image = imageFromHtml(html);
-      if (holders != null || image) return { holders, image, source: url };
+      if (holders != null) return { holders, source: url };
     } catch {}
   }
-  return { holders: null, image: '', source: '' };
+  return { holders: null, source: '' };
 }
 
 async function fallbackData(address) {
   const extra = await explorerFallback(address);
-  if (extra.holders != null || extra.image) {
-    console.log(`[holders] ${address}=${extra.holders ?? 'null'} source=${extra.source}`);
+  if (extra.holders != null) {
+    console.log(`[holders] ${address}=${extra.holders} source=${extra.source}`);
   }
   return extra;
 }
@@ -110,10 +92,10 @@ globalThis.fetch = async (input, init = {}) => {
         : finiteHolder(data?.holders_count ?? data?.holders ?? data?.holder_count ?? data?.token_holders_count);
       if (known != null) return r;
       const extra = await fallbackData(address);
-      if (extra.holders != null || extra.image) {
+      if (extra.holders != null) {
         const merged = counters
-          ? { ...data, ...(extra.holders != null ? { token_holders_count: String(extra.holders) } : {}) }
-          : { ...data, ...(extra.holders != null ? { holders_count: String(extra.holders) } : {}), ...(extra.image ? { icon_url: extra.image } : {}) };
+          ? { ...data, token_holders_count: String(extra.holders) }
+          : { ...data, holders_count: String(extra.holders) };
         return jsonResponse(merged);
       }
       return r;
@@ -124,10 +106,8 @@ globalThis.fetch = async (input, init = {}) => {
 
   const extra = await fallbackData(address);
   if (counters && extra.holders != null) return jsonResponse({ token_holders_count: String(extra.holders) });
-  if (!counters && (extra.holders != null || extra.image)) {
-    return jsonResponse({ holders_count: extra.holders == null ? undefined : String(extra.holders), icon_url: extra.image || '' });
-  }
+  if (!counters && extra.holders != null) return jsonResponse({ holders_count: String(extra.holders) });
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
-console.log('[runtime-patch] Blockscout holder provider enabled: native -> Robinscan -> Blockscout page');
+console.log('[runtime-patch] Blockscout holder provider enabled: native -> Blockscout page -> Robinscan, logos untouched');
