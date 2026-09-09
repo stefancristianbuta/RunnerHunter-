@@ -1,3 +1,5 @@
+import { queueSecurity, securitySnapshot } from './security.js';
+
 const clamp = (n, min = 0, max = 100) => Math.max(min, Math.min(max, Number(n) || 0));
 
 export function assessRisk(metrics, security = {}) {
@@ -11,6 +13,7 @@ export function assessRisk(metrics, security = {}) {
   const h1 = Number(metrics?.change1h || 0);
   const m5 = Number(metrics?.change5m || 0);
   const ratio = liquidity > 0 ? marketCap / liquidity : 0;
+  const address = metrics?.address;
 
   let risk = 0;
   const flags = [];
@@ -38,9 +41,25 @@ export function assessRisk(metrics, security = {}) {
   if (security?.verified === false) add(10, 'Unverified contract');
   if (security?.proxy === true) add(6, 'Upgradeable/proxy contract');
 
+  const onChain = securitySnapshot(address);
+  if (address) queueSecurity(address);
+  if (onChain?.securityLevel === 'FLAGGED') {
+    risk = Math.max(risk, 70);
+    for (const flag of onChain.securityFlags || []) flags.push(flag);
+  } else if (onChain?.securityLevel === 'REVIEW') {
+    risk = Math.max(risk, 35);
+    for (const flag of onChain.securityFlags || []) flags.push(flag);
+  }
+
   risk = Math.round(clamp(risk));
   const level = risk >= 55 ? 'FLAGGED' : risk >= 30 ? 'REVIEW' : 'CLEAR';
-  return { risk, riskLevel: level, riskFlags: [...new Set(flags)].slice(0, 6), marketLiquidityRatio: ratio };
+  return {
+    risk,
+    riskLevel: level,
+    riskFlags: [...new Set(flags)].slice(0, 8),
+    marketLiquidityRatio: ratio,
+    security: onChain || { securityLevel: 'PENDING', securityScore: null, securityFlags: [], contract: null, permissions: null, honeypot: null }
+  };
 }
 
 export function applyRisk(metrics, security = {}) {
