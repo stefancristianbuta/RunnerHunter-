@@ -6,10 +6,16 @@ import { JsonRpcProvider, Contract, Interface, getAddress } from 'ethers';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
 const PORT = Number(process.env.PORT || 10000);
-const RPC_URL = process.env.RH_RPC_URL || 'https://rpc.mainnet.chain.robinhood.com';
+const RPC_URLS = [...new Set([
+  ...(process.env.RH_RPC_URLS || '').split(',').map(x => x.trim()).filter(Boolean),
+  process.env.RH_RPC_URL,
+  'https://rpc.mainnet.chain.robinhood.com',
+  'https://robinhood-rpc.publicnode.com'
+].filter(Boolean))];
 const BLOCKSCOUT = process.env.BLOCKSCOUT_URL || 'https://robinhoodchain.blockscout.com/api/v2';
 const GECKO = 'https://api.geckoterminal.com/api/v2';
-const provider = new JsonRpcProvider(RPC_URL, 4663, { staticNetwork: true });
+const providers = RPC_URLS.map(url => new JsonRpcProvider(url, 4663, { staticNetwork: true }));
+const provider = providers[0];
 
 const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'.toLowerCase();
@@ -27,17 +33,34 @@ const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
 let scanning = false;
+let enriching = false;
 const started = Date.now();
 let state = {
   status: 'STARTING', lastUpdate: null, scanCycle: 0, discovered: 0,
   analyzed: 0, active: 0, errors: 0, warnings: [], latestBlock: null,
-  uptime: 0, source: 'GeckoTerminal + Robinhood RPC + Blockscout'
+  uptime: 0, source: 'GeckoTerminal + multi-RPC + Blockscout'
 };
+
+async function withRpc(task) {
+  let lastError;
+  for (let i = 0; i < providers.length; i++) {
+    try { return await task(providers[i], RPC_URLS[i]); }
+    catch (e) {
+      lastError = e;
+      if (i < providers.length - 1) state.warnings = [...state.warnings, `RPC failover ${i + 1}->${i + 2}: ${e.message}`].slice(-10);
+    }
+  }
+  throw lastError || new Error('No RPC providers configured');
+}
 
 async function tokenMeta(address) {
   const key = address.toLowerCase();
   if (metaCache.has(key)) return metaCache.get(key);
-  const call = async (method, fallback) => { try { return await new Contract(address, erc20, provider)[method](); } catch { return fallback; } };
+  const call = async (method, fallback) => {
+    try {
+      return await withRpc((p) => new Contract(address, erc20, p)[method]());
+    } catch { return fallback; }
+  };
   const [name, symbol, decimals, totalSupply] = await Promise.all([
     call('name', 'Unknown'), call('symbol', '?'), call('decimals', 18), call('totalSupply', 0n)
   ]);
@@ -46,12 +69,20 @@ async function tokenMeta(address) {
   return meta;
 }
 
+async function latestBlockNumber() {
+  try { return await withRpc((p) => p.getBlockNumber()); }
+  catch (e) {
+    state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10);
+    return null;
+  }
+}
+
 async function blockscoutToken(address) {
   const key = address.toLowerCase();
   const cached = scoutCache.get(key);
   if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.data;
   try {
-    const r = await fetch(`${BLOCKSCOUT}/tokens/${address}`, { signal: AbortSignal.timeout(7000), headers: { accept: 'application/json' } });
+    const r = await fetch(`${BLOCKSCOUT}/tokens/${address}`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
     if (!r.ok) throw new Error(`Blockscout ${r.status}`);
     const data = await r.json();
     scoutCache.set(key, { at: Date.now(), data });
@@ -72,19 +103,25 @@ function scoutInfo(scout) {
 }
 
 async function enrichRadar(results) {
-  const targets = results.slice(0, 30);
-  let cursor = 0;
-  const workers = Array.from({ length: Math.min(5, targets.length) }, async () => {
-    while (cursor < targets.length) {
-      const item = targets[cursor++];
-      const scout = await blockscoutToken(item.address);
-      const info = scoutInfo(scout);
-      item.holders = info.holders;
-      item.image = info.image;
-    }
-  });
-  await Promise.all(workers);
-  return results;
+  if (enriching) return;
+  enriching = true;
+  try {
+    const targets = results.slice(0, 30);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(8, targets.length) }, async () => {
+      while (cursor < targets.length) {
+        const item = targets[cursor++];
+        const scout = await blockscoutToken(item.address);
+        const info = scoutInfo(scout);
+        const current = radar.find(x => x.address.toLowerCase() === item.address.toLowerCase()) || item;
+        current.holders = info.holders;
+        current.image = info.image;
+      }
+    });
+    await Promise.all(workers);
+  } finally {
+    enriching = false;
+  }
 }
 
 let geckoNextAllowedAt = 0;
@@ -222,6 +259,7 @@ function passesFilter(m) {
 }
 
 async function scan() {
+  const latestBlockPromise = latestBlockNumber();
   const pools = await loadMarketPools();
   const byToken = new Map();
   for (const p of pools) {
@@ -240,11 +278,10 @@ async function scan() {
     results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, ...m, pool: p.pool, dex: p.dex, history: nextHistory });
   }
   results.sort((a, b) => b.score - a.score);
-  await enrichRadar(results);
-  let latestBlock = null;
-  try { latestBlock = await provider.getBlockNumber(); } catch (e) { state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10); }
+  const latestBlock = await latestBlockPromise;
   state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.score >= 52).length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
   radar = results;
+  void enrichRadar(results);
   console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} top=${results[0]?.symbol || 'none'}`);
 }
 
@@ -284,7 +321,7 @@ app.get('/api/token/:address', async (req, res) => {
     res.json({ ...meta, ...metrics, holders: info.holders, image: info.image, pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpc: process.env.RH_RPC_URL ? 'configured' : 'public fallback', publicFallback: !process.env.RH_RPC_URL, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
+app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
 app.use(express.static(path.join(ROOT, 'dist')));
 app.get(/.*/, (req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
 
