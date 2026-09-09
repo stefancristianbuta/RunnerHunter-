@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'url';
-import { JsonRpcProvider, Contract, Interface, getAddress } from 'ethers';
+import { JsonRpcProvider, Interface, getAddress } from 'ethers';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -19,12 +19,16 @@ const provider = providers[0];
 
 const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'.toLowerCase();
+const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const STABLE = new Set(['WETH', 'USDG', 'USDC', 'USDT', 'DAI', 'USDE']);
 const erc20 = new Interface([
   'function name() view returns (string)',
   'function symbol() view returns (string)',
   'function decimals() view returns (uint8)',
   'function totalSupply() view returns (uint256)'
+]);
+const multicall3 = new Interface([
+  'function aggregate3(tuple(address target,bool allowFailure,bytes callData)[] calls) payable returns (tuple(bool success,bytes returnData)[] returnData)'
 ]);
 
 const metaCache = new Map();
@@ -53,17 +57,59 @@ async function withRpc(task) {
   throw lastError || new Error('No RPC providers configured');
 }
 
+async function multicall(calls) {
+  const data = multicall3.encodeFunctionData('aggregate3', [calls]);
+  const raw = await withRpc((p) => p.call({ to: MULTICALL3, data }));
+  return multicall3.decodeFunctionResult('aggregate3', raw)[0];
+}
+
 async function tokenMeta(address) {
   const key = address.toLowerCase();
   if (metaCache.has(key)) return metaCache.get(key);
-  const call = async (method, fallback) => {
-    try {
-      return await withRpc((p) => new Contract(address, erc20, p)[method]());
-    } catch { return fallback; }
-  };
-  const [name, symbol, decimals, totalSupply] = await Promise.all([
-    call('name', 'Unknown'), call('symbol', '?'), call('decimals', 18), call('totalSupply', 0n)
-  ]);
+
+  let name = 'Unknown';
+  let symbol = '?';
+  let decimals = 18;
+  let totalSupply = 0n;
+
+  try {
+    const methods = ['name', 'symbol', 'decimals', 'totalSupply'];
+    const calls = methods.map(method => ({
+      target: address,
+      allowFailure: true,
+      callData: erc20.encodeFunctionData(method)
+    }));
+    const results = await multicall(calls);
+    const decode = (index, method, fallback) => {
+      try {
+        const result = results[index];
+        if (!result?.success) return fallback;
+        return erc20.decodeFunctionResult(method, result.returnData)[0] ?? fallback;
+      } catch { return fallback; }
+    };
+    name = decode(0, 'name', 'Unknown');
+    symbol = decode(1, 'symbol', '?');
+    decimals = decode(2, 'decimals', 18);
+    totalSupply = decode(3, 'totalSupply', 0n);
+  } catch {
+    const call = async (method, fallback) => {
+      try {
+        return await withRpc((p) => p.call({ to: address, data: erc20.encodeFunctionData(method) }));
+      } catch { return fallback; }
+    };
+    const decodeFallback = async (method, fallback) => {
+      const raw = await call(method, null);
+      if (raw == null) return fallback;
+      try { return erc20.decodeFunctionResult(method, raw)[0]; } catch { return fallback; }
+    };
+    [name, symbol, decimals, totalSupply] = await Promise.all([
+      decodeFallback('name', 'Unknown'),
+      decodeFallback('symbol', '?'),
+      decodeFallback('decimals', 18),
+      decodeFallback('totalSupply', 0n)
+    ]);
+  }
+
   const meta = { address: getAddress(address), name: String(name || 'Unknown'), symbol: String(symbol || '?'), decimals: Number(decimals || 18), totalSupply: String(totalSupply || 0n) };
   metaCache.set(key, meta);
   return meta;
@@ -321,7 +367,7 @@ app.get('/api/token/:address', async (req, res) => {
     res.json({ ...meta, ...metrics, holders: info.holders, image: info.image, pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
-app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
+app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, multicall3: MULTICALL3, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
 app.use(express.static(path.join(ROOT, 'dist')));
 app.get(/.*/, (req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
 
