@@ -2,6 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'url';
 import { JsonRpcProvider, Interface, getAddress } from 'ethers';
+import { applyRisk } from './risk.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -32,6 +33,7 @@ const multicall3 = new Interface([
 
 const metaCache = new Map();
 const scoutCache = new Map();
+const contractCache = new Map();
 const history = new Map();
 let radar = [];
 let geckoCache = { at: 0, pools: [] };
@@ -42,7 +44,7 @@ let enriching = false;
 const started = Date.now();
 let state = {
   status: 'STARTING', lastUpdate: null, scanCycle: 0, discovered: 0,
-  analyzed: 0, active: 0, errors: 0, warnings: [], latestBlock: null,
+  analyzed: 0, active: 0, errors: 0, flagged: 0, warnings: [], latestBlock: null,
   uptime: 0, source: 'GeckoTerminal + multi-RPC + Blockscout'
 };
 
@@ -126,6 +128,29 @@ async function blockscoutCounters(address) {
   } catch { return null; }
 }
 
+async function blockscoutContract(address) {
+  const key = address.toLowerCase();
+  const cached = contractCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.data;
+  try {
+    const r = await fetch(`${BLOCKSCOUT}/smart-contracts/${address}`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
+    if (r.status === 404) {
+      const data = { verified: false, contractExists: true, proxy: false, name: null };
+      contractCache.set(key, { at: Date.now(), data });
+      return data;
+    }
+    if (!r.ok) throw new Error(`Blockscout contract ${r.status}`);
+    const raw = await r.json();
+    const data = { verified: raw?.is_verified === true, contractExists: true, proxy: Boolean(raw?.minimal_proxy_address_hash || raw?.implementation_address_hash), name: raw?.name || null };
+    contractCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch {
+    const data = { verified: null, contractExists: null, proxy: null, name: null };
+    contractCache.set(key, { at: Date.now(), data });
+    return data;
+  }
+}
+
 function scoutInfo(scout) {
   if (!scout) return { holders: null, image: '' };
   const rawHolders = scout.holders_count ?? scout.holders ?? scout.holder_count ?? scout.token_holders_count;
@@ -143,7 +168,7 @@ async function enrichRadar(results) {
     const workers = Array.from({ length: Math.min(4, targets.length) }, async () => {
       while (cursor < targets.length) {
         const item = results[cursor++];
-        const scout = await blockscoutToken(item.address);
+        const [scout, contract] = await Promise.all([blockscoutToken(item.address), blockscoutContract(item.address)]);
         const info = scoutInfo(scout);
         let holders = info.holders;
         if (holders == null) {
@@ -153,6 +178,15 @@ async function enrichRadar(results) {
         }
         const current = radar.find(x => x.address.toLowerCase() === item.address.toLowerCase()) || item;
         current.holders = holders;
+        current.verified = contract?.verified ?? null;
+        current.contractExists = contract?.contractExists ?? null;
+        current.proxy = contract?.proxy ?? null;
+        const secured = applyRisk(current, { holders, ...contract });
+        current.risk = secured.risk;
+        current.riskLevel = secured.riskLevel;
+        current.riskFlags = secured.riskFlags;
+        current.marketLiquidityRatio = secured.marketLiquidityRatio;
+        if (secured.stage !== current.stage) current.stage = secured.stage;
         current.image = info.image || current.image || '';
       }
     });
@@ -342,14 +376,18 @@ async function scan() {
     const prev = history.get(key) || [];
     const last = prev[prev.length - 1];
     if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score) history.set(key, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
-    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...m, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
+    const cachedSecurity = contractCache.get(key)?.data || {};
+    const cachedScout = scoutCache.get(key)?.data;
+    const holderFromCache = scoutInfo(cachedScout).holders;
+    const metrics = applyRisk(m, { holders: holderFromCache, ...cachedSecurity });
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...metrics, verified: cachedSecurity.verified ?? null, contractExists: cachedSecurity.contractExists ?? null, proxy: cachedSecurity.proxy ?? null, holders: holderFromCache, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
-  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.score >= 52).length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
+  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.score >= 52 && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
   radar = results;
   void enrichRadar(results);
-  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} top=${results[0]?.symbol || 'none'}`);
+  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} flagged=${state.flagged} top=${results[0]?.symbol || 'none'}`);
 }
 
 async function safeScan() {
@@ -373,7 +411,7 @@ app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
     const meta = await tokenMeta(address);
-    const scout = await blockscoutToken(address);
+    const [scout, contract] = await Promise.all([blockscoutToken(address), blockscoutContract(address)]);
     const info = scoutInfo(scout);
     let holders = info.holders;
     if (holders == null) {
@@ -382,16 +420,16 @@ app.get('/api/token/:address', async (req, res) => {
       if (Number.isFinite(n)) holders = n;
     }
     const cachedRadar = radar.find(x => x.address.toLowerCase() === address.toLowerCase());
-    if (cachedRadar && cachedRadar.pool) return res.json({ ...meta, ...cachedRadar, holders: holders ?? cachedRadar.holders ?? null, image: info.image || cachedRadar.image || '' });
+    if (cachedRadar && cachedRadar.pool) return res.json({ ...meta, ...cachedRadar, holders: holders ?? cachedRadar.holders ?? null, verified: contract?.verified ?? cachedRadar.verified ?? null, contractExists: contract?.contractExists ?? cachedRadar.contractExists ?? null, proxy: contract?.proxy ?? cachedRadar.proxy ?? null, image: info.image || cachedRadar.image || '' });
     let pools = null;
     try { pools = await gecko(`/networks/robinhood/tokens/${address}/pools?include=base_token,quote_token,dex`); } catch { pools = null; }
     const normalized = pools ? (pools?.data || []).map(x => normalizePool(x, includedTokenMap(pools))).filter(Boolean).slice(0, 10) : [];
-    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'EARLY', history: history.get(address.toLowerCase()) || [] });
+    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'EARLY', risk: 100, riskLevel: 'REVIEW', riskFlags: ['No active market pool found'], history: history.get(address.toLowerCase()) || [] });
     const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
-    const metrics = scorePool(best);
+    const metrics = applyRisk(scorePool(best), { holders, ...contract });
     const key = address.toLowerCase();
     history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score }].slice(-24));
-    res.json({ ...meta, ...metrics, holders, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
+    res.json({ ...meta, ...metrics, holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), multicall3: MULTICALL3, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
