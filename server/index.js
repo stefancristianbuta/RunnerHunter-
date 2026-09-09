@@ -142,7 +142,7 @@ async function enrichRadar(results) {
     let cursor = 0;
     const workers = Array.from({ length: Math.min(4, targets.length) }, async () => {
       while (cursor < targets.length) {
-        const item = targets[cursor++];
+        const item = results[cursor++];
         const scout = await blockscoutToken(item.address);
         const info = scoutInfo(scout);
         let holders = info.holders;
@@ -317,6 +317,7 @@ function scorePool(p) {
 }
 
 function passesFilter(m) {
+  if (m.marketCap < 10000) return false;
   if (m.liquidity < 2500) return false;
   if (m.marketCap > 0 && m.marketCap < Math.max(2500, m.liquidity * 0.35)) return false;
   if (m.buys + m.sells < 2) return false;
