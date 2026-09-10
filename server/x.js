@@ -33,7 +33,7 @@ function cleanSymbol(symbol) {
 function eligible(item) {
   if (!item || !configured()) return false;
   if (Number(item.score || 0) < MIN_SCORE) return false;
-  if (!['EARLY', 'GROWING'].includes(item.stage)) return false;
+  if (!['EARLY', 'GROWING', 'RUNNING'].includes(item.stage)) return false;
   if (item.riskLevel !== 'CLEAR') return false;
 
   const input = item.stageSignals?.inputs || {};
