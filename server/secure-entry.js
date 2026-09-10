@@ -17,7 +17,7 @@ registerHooks({
     if (url === TARGET) {
       source = source.replace(
         "import { applyRisk, classifyStage } from './risk.js';",
-        "import { applyRisk, classifyStage, explainStage } from './risk.js';\nimport { recordTelemetry, telemetrySnapshot } from './telemetry.js';"
+        "import { applyRisk, classifyStage, explainStage } from './risk.js';\nimport { recordTelemetry, telemetrySnapshot, getTelemetryForToken } from './telemetry.js';"
       );
 
       source = source.replace(
@@ -40,7 +40,8 @@ registerHooks({
       source = source.replace(
         '    const metrics = applyRisk({ ...m, history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });',
         `    const metrics = applyRisk({ ...m, address: getAddress(p.token), history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });
-    recordTelemetry({ cycle: state.scanCycle + 1, outcome: metrics.riskLevel === 'FLAGGED' ? 'RISK_REJECT' : 'CANDIDATE', token: p.token, address: getAddress(p.token), symbol: p.symbol, name: p.name, score: metrics.score, stage: metrics.stage, previousStage, stageReason: metrics.stageReason, stageSignals: metrics.stageSignals, risk: metrics.risk, riskLevel: metrics.riskLevel, riskFlags: metrics.riskFlags, marketCap: metrics.marketCap, liquidity: metrics.liquidity, volume1h: metrics.volume1h, pressure: metrics.pressure, buys: metrics.buys, sells: metrics.sells, ageMs: metrics.ageMs, change5m: metrics.change5m, change15m: metrics.change15m, change30m: metrics.change30m, change1h: metrics.change1h, change6h: metrics.change6h, transition: previousStage !== metrics.stage });`
+    recordTelemetry({ cycle: state.scanCycle + 1, outcome: metrics.riskLevel === 'FLAGGED' ? 'RISK_REJECT' : 'CANDIDATE', token: p.token, address: getAddress(p.token), symbol: p.symbol, name: p.name, score: metrics.score, stage: metrics.stage, previousStage, stageReason: metrics.stageReason, stageSignals: metrics.stageSignals, risk: metrics.risk, riskLevel: metrics.riskLevel, riskFlags: metrics.riskFlags, marketCap: metrics.marketCap, liquidity: metrics.liquidity, volume1h: metrics.volume1h, pressure: metrics.pressure, buys: metrics.buys, sells: metrics.sells, ageMs: metrics.ageMs, change5m: metrics.change5m, change15m: metrics.change15m, change30m: metrics.change30m, change1h: metrics.change1h, change6h: metrics.change6h, transition: previousStage !== metrics.stage });
+    metrics.telemetry = getTelemetryForToken(getAddress(p.token));`
       );
 
       source = source.replace(
