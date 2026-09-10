@@ -1,5 +1,8 @@
+import { JsonRpcProvider } from 'ethers';
+
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
+const nativeGetBlockNumber = JsonRpcProvider.prototype.getBlockNumber;
 const BS = 'https://robinhoodchain.blockscout.com';
 const ROBINSCAN = 'https://robinscan.io';
 const ROBINHOOD_LOGO = 'https://cdn.robinhood.com/ncw_assets/logos';
@@ -145,6 +148,16 @@ globalThis.fetch = async (input, init = {}) => {
   return new Response('', { status: 503, headers: { 'content-type': 'application/json' } });
 };
 
+// A stuck RPC getBlockNumber used to hold the entire 10s scan loop because
+// scan() awaits the latest block after scoring. Bound only this non-critical
+// telemetry call so a sick RPC cannot freeze radar updates.
+JsonRpcProvider.prototype.getBlockNumber = function (...args) {
+  return Promise.race([
+    nativeGetBlockNumber.apply(this, args),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('RPC getBlockNumber timeout')), 3000))
+  ]);
+};
+
 // RunnerHunter currently schedules its main scan at 30s. Keep the application
 // code unchanged but run that specific loop at 10s so fresh momentum is not
 // already stale when the user opens the radar. Other timers are untouched.
@@ -152,4 +165,5 @@ globalThis.setInterval = (fn, delay, ...args) =>
   nativeSetInterval(fn, delay === 30000 ? 10000 : delay, ...args);
 
 console.log('[runtime-patch] Blockscout holder + logo provider enabled: native -> Robinhood CDN only, no explorer page images');
+console.log('[runtime-patch] RPC getBlockNumber timeout guard enabled: 3s');
 console.log('[runtime-patch] Radar scan interval override: 30s -> 10s');
