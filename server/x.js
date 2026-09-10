@@ -91,8 +91,7 @@ async function refreshAccessToken() {
       },
       body: new URLSearchParams({
         grant_type: 'refresh_token',
-        refresh_token: refreshToken,
-        client_id: clientId
+        refresh_token: refreshToken
       }),
       signal: AbortSignal.timeout(8000)
     });
