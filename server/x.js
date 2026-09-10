@@ -1,4 +1,5 @@
 const X_POST_URL = 'https://api.x.com/2/tweets';
+const X_TOKEN_URL = 'https://api.x.com/2/oauth2/token';
 const MIN_SCORE = Number(process.env.X_MIN_SCORE || 90);
 const TOKEN_COOLDOWN_MS = Number(process.env.X_TOKEN_COOLDOWN_MS || 12 * 60 * 60 * 1000);
 const GLOBAL_COOLDOWN_MS = Number(process.env.X_GLOBAL_COOLDOWN_MS || 30 * 60 * 1000);
@@ -8,6 +9,8 @@ let lastPostAt = 0;
 let postTimes = [];
 const tokenPosts = new Map();
 let accessToken = process.env.X_ACCESS_TOKEN || '';
+let refreshToken = process.env.X_REFRESH_TOKEN || '';
+let refreshInFlight = null;
 
 function configured() {
   return Boolean(accessToken);
@@ -33,8 +36,7 @@ function eligible(item) {
   if (!['EARLY', 'GROWING'].includes(item.stage)) return false;
   if (item.riskLevel !== 'CLEAR') return false;
 
-  const s = item.stageSignals;
-  const input = s?.inputs || {};
+  const input = item.stageSignals?.inputs || {};
   const m15 = Number(input.m15 || 0);
   const m30 = Number(input.m30 || 0);
   const m15Trades = Number(input.m15Trades || 0);
@@ -70,7 +72,37 @@ function formatPost(item) {
   ].join('\n');
 }
 
-async function postToX(text) {
+async function refreshAccessToken() {
+  if (!refreshToken || !process.env.X_CLIENT_ID || !process.env.X_CLIENT_SECRET) {
+    throw new Error('X OAuth refresh is not configured');
+  }
+  if (refreshInFlight) return refreshInFlight;
+
+  refreshInFlight = (async () => {
+    const basic = Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64');
+    const response = await fetch(X_TOKEN_URL, {
+      method: 'POST',
+      headers: {
+        authorization: `Basic ${basic}`,
+        'content-type': 'application/x-www-form-urlencoded'
+      },
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+      signal: AbortSignal.timeout(8000)
+    });
+    const body = await response.text();
+    if (!response.ok) throw new Error(`X OAuth refresh ${response.status}: ${body.slice(0, 300)}`);
+    const data = JSON.parse(body);
+    if (!data.access_token) throw new Error('X OAuth refresh returned no access token');
+    accessToken = data.access_token;
+    if (data.refresh_token) refreshToken = data.refresh_token;
+    console.log('[x] OAuth access token refreshed');
+    return accessToken;
+  })().finally(() => { refreshInFlight = null; });
+
+  return refreshInFlight;
+}
+
+async function postToX(text, retry = true) {
   const response = await fetch(X_POST_URL, {
     method: 'POST',
     headers: {
@@ -81,9 +113,11 @@ async function postToX(text) {
     signal: AbortSignal.timeout(8000)
   });
 
-  if (response.status === 401) {
-    throw new Error('X API 401: X_ACCESS_TOKEN is invalid or expired');
+  if (response.status === 401 && retry && refreshToken) {
+    await refreshAccessToken();
+    return postToX(text, false);
   }
+
   const body = await response.text();
   if (!response.ok) throw new Error(`X API ${response.status}: ${body.slice(0, 300)}`);
   return JSON.parse(body);
@@ -115,6 +149,7 @@ export function xStatus() {
   postTimes = postTimes.filter(ts => now - ts < 24 * 60 * 60 * 1000);
   return {
     configured: configured(),
+    refreshConfigured: Boolean(refreshToken && process.env.X_CLIENT_ID && process.env.X_CLIENT_SECRET),
     minScore: MIN_SCORE,
     tokenCooldownHours: Math.round(TOKEN_COOLDOWN_MS / 3600000),
     globalCooldownMinutes: Math.round(GLOBAL_COOLDOWN_MS / 60000),
