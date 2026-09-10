@@ -1,5 +1,7 @@
+import express from 'express';
 import { JsonRpcProvider } from 'ethers';
 import { publishEligibleRunner, xStatus } from './x.js';
+import { installXOauth } from './x-oauth.js';
 
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const nativeGetBlockNumber = JsonRpcProvider.prototype.getBlockNumber;
@@ -97,6 +99,14 @@ globalThis.fetch = wrappedFetch;
 globalThis.setInterval = (fn, delay, ...args) =>
   nativeSetInterval(fn, delay === 30000 ? 10000 : delay, ...args);
 
+// Install the OAuth routes immediately before Express starts listening. The installer
+// moves them ahead of the SPA catch-all so /auth/x/* is never swallowed by index.html.
+const nativeListen = express.application.listen;
+express.application.listen = function (...args) {
+  installXOauth(this);
+  return nativeListen.apply(this, args);
+};
+
 // X publishing is deliberately isolated from the radar engine. It polls the public
 // radar endpoint and only posts when server-side X gates in x.js all pass.
 async function pollXPublisher() {
@@ -121,4 +131,4 @@ async function pollXPublisher() {
 nativeSetInterval(pollXPublisher, 15000);
 setTimeout(pollXPublisher, 12000);
 
-console.log(`[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval + X ${xStatus().configured ? 'configured' : 'disabled'}`);
+console.log(`[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval + X ${xStatus().configured ? 'configured' : 'disabled'} + OAuth PKCE ready`);
