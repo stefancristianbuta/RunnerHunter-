@@ -16,7 +16,7 @@ jobs:
       - run: node --check server/index.js
       - run: npm run build
       - run: |
-          node server/index.js > /tmp/runnerhunter.log 2>&1 &
+          PORT=10000 node server/index.js > /tmp/runnerhunter.log 2>&1 &
           pid=$!
           sleep 5
           curl -fsS http://127.0.0.1:10000/health
