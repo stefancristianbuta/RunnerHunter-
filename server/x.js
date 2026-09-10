@@ -67,6 +67,7 @@ function formatPost(item) {
     `Momentum: ${Number(item.change1h || 0).toFixed(1)}%`,
     `Liquidity: ${compactMoney(item.liquidity)}`,
     `Volume 1H: ${compactMoney(item.volume1h)}`,
+    'Detection only.',
     '',
     `CA: ${item.address}`
   ].join('\n');
