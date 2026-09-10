@@ -1,6 +1,7 @@
 import { queueSecurity, securitySnapshot } from './security.js';
 
 const clamp = (n, min = 0, max = 100) => Math.max(min, Math.min(max, Number(n) || 0));
+const EARLY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 export function assessRisk(metrics, security = {}) {
   const marketCap = Number(metrics?.marketCap || 0);
@@ -64,6 +65,15 @@ export function assessRisk(metrics, security = {}) {
 
 export function applyRisk(metrics, security = {}) {
   const result = assessRisk(metrics, security);
-  const stage = result.riskLevel === 'FLAGGED' ? 'FLAGGED' : metrics.stage;
+  let stage = result.riskLevel === 'FLAGGED' ? 'FLAGGED' : metrics.stage;
+
+  // EARLY is a strict discovery window: a token must have a known pool age
+  // of <= 6 hours. Older tokens remain in the radar and are classified by
+  // their momentum/trading stage instead of being excluded from the ecosystem.
+  const ageMs = Number(metrics?.ageMs);
+  if (stage === 'EARLY' && Number.isFinite(ageMs) && ageMs > EARLY_MAX_AGE_MS) {
+    stage = 'GROWING';
+  }
+
   return { ...metrics, ...result, stage };
 }
