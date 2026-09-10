@@ -3,6 +3,77 @@ import { queueSecurity, securitySnapshot } from './security.js';
 const clamp = (n, min = 0, max = 100) => Math.max(min, Math.min(max, Number(n) || 0));
 const EARLY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
+const n = (x, k) => Number(x?.[k] || 0);
+
+function tfStats(metrics, key) {
+  const tx = metrics?.tx?.[key] || {};
+  const buys = n(tx, 'buys');
+  const sells = n(tx, 'sells');
+  const total = buys + sells;
+  return {
+    buys,
+    sells,
+    total,
+    pressure: total ? buys / total * 100 : 50,
+    buyers: n(tx, 'buyers'),
+    sellers: n(tx, 'sellers'),
+    change: Number(metrics?.changes?.[key] ?? metrics?.[`change${key}`] ?? 0),
+    volume: Number(metrics?.volume?.[key] ?? metrics?.[`volume${key}`] ?? 0)
+  };
+}
+
+export function classifyStage(metrics, previousHistory = []) {
+  const h1 = Number(metrics?.change1h || 0);
+  const h6 = Number(metrics?.change6h || 0);
+  const m5 = Number(metrics?.change5m || 0);
+  const volume1h = Number(metrics?.volume1h || 0);
+  const pressure = Number(metrics?.pressure || 50);
+  const totalTrades = Number(metrics?.buys || 0) + Number(metrics?.sells || 0);
+  const ageMs = Number(metrics?.ageMs);
+
+  const m5tf = tfStats(metrics, 'm5');
+  const m15 = tfStats(metrics, 'm15');
+  const m30 = tfStats(metrics, 'm30');
+
+  const m15Active = m15.total >= 3;
+  const m30Active = m30.total >= 4;
+  const m15Bullish = m15.change >= 0 || (m15Active && m15.pressure >= 55);
+  const m30Bullish = m30.change >= 0 || (m30Active && m30.pressure >= 55);
+  const m15Strong = m15.change >= 1 || (m15Active && m15.pressure >= 58);
+  const m30Strong = m30.change >= 1.5 || (m30Active && m30.pressure >= 58);
+  const m15Weak = m15.change <= -1 || (m15Active && m15.pressure <= 45);
+  const m30Weak = m30.change <= -1.5 || (m30Active && m30.pressure <= 45);
+
+  const early = Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS &&
+    (h1 > 2 || m5 > 1 || m15.change > 1) &&
+    volume1h >= 100 && pressure >= 52 && totalTrades >= 3 &&
+    (m5tf.total >= 2 || m15Active || m30Active);
+
+  const growing =
+    (h1 >= 3 || h6 >= 5 || m15.change >= 2) &&
+    m5 >= 0 && volume1h >= 100 && pressure >= 55 &&
+    (m15Bullish || m30Bullish) && totalTrades >= 4;
+
+  const running = volume1h >= 500 && pressure >= 60 && totalTrades >= 6 &&
+    ((h1 >= 10 || h6 >= 20) && m15Strong && m30Strong ||
+      (m5 >= 2 && m15Strong && m30Bullish && (h1 >= 3 || m30.change >= 1)));
+
+  const hadPriorRun = previousHistory.some(x => ['EARLY', 'GROWING', 'RUNNING'].includes(x.stage)) ||
+    previousHistory.some(x => Number(x.score) >= 68);
+
+  const pullback = hadPriorRun && (
+    (h1 < -3 && m5 < 0 && (m15Weak || m30Weak)) ||
+    (m15.change <= -1.5 && m30.change < 0 && m15Active && m30Active) ||
+    (m5 <= -2 && m15Weak && m5tf.total >= 3)
+  );
+
+  if (pullback) return 'PULLBACK';
+  if (early) return 'EARLY';
+  if (running) return 'RUNNING';
+  if (growing) return 'GROWING';
+  return 'STABLE';
+}
+
 export function assessRisk(metrics, security = {}) {
   const marketCap = Number(metrics?.marketCap || 0);
   const liquidity = Number(metrics?.liquidity || 0);
@@ -65,29 +136,7 @@ export function assessRisk(metrics, security = {}) {
 
 export function applyRisk(metrics, security = {}) {
   const result = assessRisk(metrics, security);
-  const h1 = Number(metrics?.change1h || 0);
-  const h6 = Number(metrics?.change6h || 0);
-  const m5 = Number(metrics?.change5m || 0);
-  const volume1h = Number(metrics?.volume1h || 0);
-  const pressure = Number(metrics?.pressure || 50);
-  const totalTrades = Number(metrics?.buys || 0) + Number(metrics?.sells || 0);
-  const ageMs = Number(metrics?.ageMs);
-  const wasPullback = metrics?.stage === 'PULLBACK';
-
-  // Stage classification is momentum-first. Score ranks candidates; it does not
-  // demote a token with clear market momentum into STABLE.
-  const early = Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS &&
-    (h1 > 2 || m5 > 1) && volume1h >= 100 && pressure >= 55 && totalTrades >= 3;
-  const running = (h1 >= 10 || h6 >= 20 || m5 >= 2) &&
-    volume1h >= 500 && pressure >= 60;
-  const growing = (h1 >= 3 || h6 >= 5) &&
-    m5 >= 0 && volume1h >= 100 && pressure >= 55;
-
-  let stage = 'STABLE';
-  if (wasPullback) stage = 'PULLBACK';
-  else if (early) stage = 'EARLY';
-  else if (running) stage = 'RUNNING';
-  else if (growing) stage = 'GROWING';
-
+  const previousHistory = Array.isArray(metrics?.history) ? metrics.history : [];
+  const stage = classifyStage(metrics, previousHistory);
   return { ...metrics, ...result, stage };
 }
