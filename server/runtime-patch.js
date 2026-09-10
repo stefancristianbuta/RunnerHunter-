@@ -1,4 +1,5 @@
 import { JsonRpcProvider } from 'ethers';
+import { publishEligibleRunner, xStatus } from './x.js';
 
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const nativeGetBlockNumber = JsonRpcProvider.prototype.getBlockNumber;
@@ -96,4 +97,28 @@ globalThis.fetch = wrappedFetch;
 globalThis.setInterval = (fn, delay, ...args) =>
   nativeSetInterval(fn, delay === 30000 ? 10000 : delay, ...args);
 
-console.log('[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval');
+// X publishing is deliberately isolated from the radar engine. It polls the public
+// radar endpoint and only posts when server-side X gates in x.js all pass.
+async function pollXPublisher() {
+  if (!process.env.X_ACCESS_TOKEN) return;
+  try {
+    const port = Number(process.env.PORT || 8080);
+    const response = await nativeFetch(`http://127.0.0.1:${port}/api/radar`, {
+      signal: AbortSignal.timeout(5000),
+      headers: { accept: 'application/json' }
+    });
+    if (!response.ok) return;
+    const radar = await response.json();
+    for (const item of Array.isArray(radar) ? radar : []) {
+      const result = await publishEligibleRunner(item);
+      if (result.posted) break;
+    }
+  } catch (error) {
+    console.error(`[x-publisher:error] ${error.message}`);
+  }
+}
+
+nativeSetInterval(pollXPublisher, 15000);
+setTimeout(pollXPublisher, 12000);
+
+console.log(`[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval + X ${xStatus().configured ? 'configured' : 'disabled'}`);
