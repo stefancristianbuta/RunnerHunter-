@@ -5,6 +5,14 @@ const TOKEN_COOLDOWN_MS = Number(process.env.X_TOKEN_COOLDOWN_MS || 12 * 60 * 60
 const GLOBAL_COOLDOWN_MS = Number(process.env.X_GLOBAL_COOLDOWN_MS || 30 * 60 * 1000);
 const MAX_POSTS_PER_DAY = Number(process.env.X_MAX_POSTS_PER_DAY || 6);
 const RATE_LIMIT_BACKOFF_MS = Number(process.env.X_RATE_LIMIT_BACKOFF_MS || 30 * 60 * 1000);
+const MATURE_MC = Number(process.env.X_MATURE_MC || 300000);
+const MATURE_AGE_MS = Number(process.env.X_MATURE_AGE_MS || 6 * 60 * 60 * 1000);
+const SURVIVAL_WINDOWS = [
+  { maxMc: 100000, ms: 15 * 60 * 1000 },
+  { maxMc: 250000, ms: 12 * 60 * 1000 },
+  { maxMc: 300000, ms: 10 * 60 * 1000 },
+  { maxMc: Infinity, ms: 10 * 60 * 1000 }
+];
 
 let lastPostAt = 0;
 let postTimes = [];
@@ -33,11 +41,73 @@ function cleanSymbol(symbol) {
   return value.startsWith('$') ? value : `$${value}`;
 }
 
+function securityPass(item) {
+  const security = item.security || {};
+  const permissions = security.permissions || {};
+  const honeypot = security.honeypot || {};
+  const controlled = ['mint', 'blacklist', 'pause', 'tax', 'limits', 'upgradeable']
+    .some(key => permissions[key]?.controlled === true);
+
+  if (item.riskLevel !== 'CLEAR') return false;
+  if (security.securityLevel !== 'CLEAR') return false;
+  if (Number(security.securityScore ?? 999) >= 20) return false;
+  if (item.contractExists === false || security.contract?.exists === false) return false;
+  if (item.verified !== true || security.contract?.verified !== true) return false;
+  if (controlled) return false;
+  if (honeypot.verdict !== 'PASS') return false;
+  if (honeypot.canBuy !== true || honeypot.canSell !== true) return false;
+  if (Number.isFinite(Number(honeypot.roundTripLossPct)) && Number(honeypot.roundTripLossPct) > 25) return false;
+  return true;
+}
+
+function survivalWindowMs(marketCap) {
+  const mc = Number(marketCap || 0);
+  return SURVIVAL_WINDOWS.find(x => mc < x.maxMc || x.maxMc === Infinity)?.ms || 10 * 60 * 1000;
+}
+
+function survivalGate(item) {
+  const mc = Number(item.marketCap || 0);
+  if (!Number.isFinite(mc) || mc < 50000) return { pass: false, reason: 'mc-below-50k' };
+
+  const ageMs = Number(item.ageMs);
+  if (mc >= MATURE_MC && Number.isFinite(ageMs) && ageMs > MATURE_AGE_MS) {
+    return { pass: true, reason: 'mature-no-delay' };
+  }
+
+  const requiredMs = survivalWindowMs(mc);
+  const history = Array.isArray(item.history) ? item.history.filter(x => Number.isFinite(Number(x.ts))).sort((a, b) => Number(a.ts) - Number(b.ts)) : [];
+  const now = Date.now();
+  const recent = history.filter(x => now - Number(x.ts) <= requiredMs);
+  if (recent.length < 3) return { pass: false, reason: 'survival-observations' };
+  const first = Number(recent[0].ts);
+  if (!Number.isFinite(first) || now - first < requiredMs) return { pass: false, reason: 'survival-window' };
+
+  const minMc = mc >= MATURE_MC ? MATURE_MC : mc >= 250000 ? 250000 : mc >= 100000 ? 100000 : 50000;
+  const healthy = recent.every(x =>
+    Number(x.marketCap || 0) >= minMc &&
+    Number(x.liquidity || 0) >= 5000 &&
+    Number(x.buys || 0) > 0 &&
+    Number(x.sells || 0) > 0 &&
+    Number(x.volume1h || 0) >= 100 &&
+    Number(x.pressure || 0) >= 52 &&
+    Number(x.risk || 999) < 20 &&
+    String(x.riskLevel || '') === 'CLEAR' &&
+    Number(x.change5m || 0) > -20 &&
+    Number(x.change15m || 0) > -15 &&
+    Number(x.change30m || 0) > -15
+  );
+  if (!healthy) return { pass: false, reason: 'survival-quality' };
+
+  const last = recent[recent.length - 1];
+  if (Number(last.marketCap || 0) < minMc || Number(last.liquidity || 0) < 5000) return { pass: false, reason: 'current-floor' };
+  return { pass: true, reason: `${Math.round(requiredMs / 60000)}m-survived` };
+}
+
 function eligible(item) {
   if (!item || !configured()) return false;
   if (Number(item.score || 0) < MIN_SCORE) return false;
   if (!['EARLY', 'GROWING', 'RUNNING'].includes(item.stage)) return false;
-  if (item.riskLevel !== 'CLEAR') return false;
+  if (!securityPass(item)) return false;
 
   const input = item.stageSignals?.inputs || {};
   const m15 = Number(input.m15 || 0);
@@ -50,6 +120,7 @@ function eligible(item) {
   const confirmed15 = m15Trades >= 3 && (m15 >= 0 || m15Pressure >= 55);
   const confirmed30 = m30Trades >= 4 && (m30 >= 0 || m30Pressure >= 55);
   if (!confirmed15 || !confirmed30) return false;
+  if (!survivalGate(item).pass) return false;
 
   const now = Date.now();
   if (now < rateLimitUntil) return false;
@@ -93,10 +164,7 @@ async function refreshAccessToken() {
         'content-type': 'application/x-www-form-urlencoded',
         accept: 'application/json'
       },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: refreshToken
-      }),
+      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
       signal: AbortSignal.timeout(8000)
     });
     const body = await response.text();
@@ -113,26 +181,17 @@ async function refreshAccessToken() {
 }
 
 async function postToX(text, retry = true) {
-  if (Date.now() < rateLimitUntil) {
-    throw new Error(`X API 429 backoff active until ${new Date(rateLimitUntil).toISOString()}`);
-  }
-
+  if (Date.now() < rateLimitUntil) throw new Error(`X API 429 backoff active until ${new Date(rateLimitUntil).toISOString()}`);
   const response = await fetch(X_POST_URL, {
     method: 'POST',
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      'content-type': 'application/json',
-      accept: 'application/json'
-    },
+    headers: { authorization: `Bearer ${accessToken}`, 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify({ text }),
     signal: AbortSignal.timeout(8000)
   });
 
   if ((response.status === 401 || response.status === 403) && retry && refreshToken) {
     const body = await response.text();
-    if (response.status === 403 && !/Unsupported Authentication|Application-Only/i.test(body)) {
-      throw new Error(`X API ${response.status}: ${body.slice(0, 300)}`);
-    }
+    if (response.status === 403 && !/Unsupported Authentication|Application-Only/i.test(body)) throw new Error(`X API ${response.status}: ${body.slice(0, 300)}`);
     await refreshAccessToken();
     return postToX(text, false);
   }
@@ -151,7 +210,6 @@ async function postToX(text, retry = true) {
 export async function publishEligibleRunner(item) {
   if (!eligible(item)) return { posted: false, reason: 'not-eligible' };
   if (postInFlight) return { posted: false, reason: 'post-in-flight' };
-
   const text = formatPost(item);
   if (text.length > 280) return { posted: false, reason: 'post-too-long' };
 
@@ -172,7 +230,6 @@ export async function publishEligibleRunner(item) {
       postInFlight = null;
     }
   })();
-
   return postInFlight;
 }
 
@@ -180,9 +237,11 @@ export function xStatus() {
   const now = Date.now();
   postTimes = postTimes.filter(ts => now - ts < 24 * 60 * 60 * 1000);
   return {
-    configured: configured(),
-    refreshConfigured: Boolean(refreshToken && process.env.X_CLIENT_ID && process.env.X_CLIENT_SECRET),
+    configured: configured(), refreshConfigured: Boolean(refreshToken && process.env.X_CLIENT_ID && process.env.X_CLIENT_SECRET),
     minScore: MIN_SCORE,
+    matureMc: MATURE_MC,
+    matureAgeHours: MATURE_AGE_MS / 3600000,
+    survivalWindowsMinutes: SURVIVAL_WINDOWS.map(x => ({ maxMc: x.maxMc, minutes: x.ms / 60000 })),
     tokenCooldownHours: Math.round(TOKEN_COOLDOWN_MS / 3600000),
     globalCooldownMinutes: Math.round(GLOBAL_COOLDOWN_MS / 60000),
     postsLast24h: postTimes.length,
