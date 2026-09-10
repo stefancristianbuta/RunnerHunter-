@@ -1,9 +1,9 @@
 const X_POST_URL = 'https://api.x.com/2/tweets';
 const X_TOKEN_URL = 'https://api.x.com/2/oauth2/token';
-const MIN_SCORE = Number(process.env.X_MIN_SCORE || 90);
-const TOKEN_COOLDOWN_MS = Number(process.env.X_TOKEN_COOLDOWN_MS || 12 * 60 * 60 * 1000);
-const GLOBAL_COOLDOWN_MS = Number(process.env.X_GLOBAL_COOLDOWN_MS || 30 * 60 * 1000);
-const MAX_POSTS_PER_DAY = Number(process.env.X_MAX_POSTS_PER_DAY || 6);
+const MIN_SCORE = Number(process.env.X_MIN_SCORE || 80);
+const TOKEN_COOLDOWN_MS = Number(process.env.X_TOKEN_COOLDOWN_MS || 2 * 60 * 60 * 1000);
+const GLOBAL_COOLDOWN_MS = Number(process.env.X_GLOBAL_COOLDOWN_MS || 10 * 60 * 1000);
+const MAX_POSTS_PER_DAY = Number(process.env.X_MAX_POSTS_PER_DAY || 12);
 
 let lastPostAt = 0;
 let postTimes = [];
@@ -44,8 +44,9 @@ function eligible(item) {
   const m15Pressure = Number(input.m15Pressure || 0);
   const m30Pressure = Number(input.m30Pressure || 0);
 
-  const confirmed15 = m15Trades >= 3 && (m15 >= 0 || m15Pressure >= 55);
-  const confirmed30 = m30Trades >= 4 && (m30 >= 0 || m30Pressure >= 55);
+  // Temporary test gate: keep both timeframes confirmed, but use lighter activity requirements.
+  const confirmed15 = m15Trades >= 2 && (m15 >= -1 || m15Pressure >= 52);
+  const confirmed30 = m30Trades >= 2 && (m30 >= -1 || m30Pressure >= 52);
   if (!confirmed15 || !confirmed30) return false;
 
   const now = Date.now();
