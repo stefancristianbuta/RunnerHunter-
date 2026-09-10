@@ -119,10 +119,10 @@ export function stageSignals(metrics, previousHistory = []) {
 
 export function explainStage(metrics, previousHistory = []) {
   const s = stageSignals(metrics, previousHistory);
-  if (s.pullback.pass) return { stage: 'PULLBACK', reason: 'Prior active run plus pullback pattern', signals: s };
-  if (s.early.pass) return { stage: 'EARLY', reason: 'Fresh enough with initial momentum, volume, pressure, trades and timeframe activity', signals: s };
-  if (s.growing.pass) return { stage: 'GROWING', reason: s.growing.pullbackRecovery ? 'Higher-timeframe momentum confirmed despite a healthy M5 pullback' : 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
   if (s.running.pass) return { stage: 'RUNNING', reason: 'High volume, buy pressure, trade activity and momentum structure', signals: s };
+  if (s.pullback.pass) return { stage: 'PULLBACK', reason: 'Prior active run plus pullback pattern', signals: s };
+  if (s.growing.pass) return { stage: 'GROWING', reason: s.growing.pullbackRecovery ? 'Higher-timeframe momentum confirmed despite a healthy M5 pullback' : 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
+  if (s.early.pass) return { stage: 'EARLY', reason: 'Fresh enough with initial momentum, volume, pressure, trades and timeframe activity', signals: s };
   return { stage: 'STABLE', reason: 'No active stage threshold fully passed', signals: s };
 }
 
