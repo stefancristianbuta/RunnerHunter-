@@ -22,10 +22,6 @@ function tfStats(metrics, key) {
   };
 }
 
-function check(value, actual, expected) {
-  return { pass: Boolean(value), actual, expected };
-}
-
 export function stageSignals(metrics, previousHistory = []) {
   const h1 = Number(metrics?.change1h || 0);
   const h6 = Number(metrics?.change6h || 0);
@@ -56,8 +52,6 @@ export function stageSignals(metrics, previousHistory = []) {
     trades: totalTrades >= 3,
     timeframeActivity: m5tf.total >= 2 || m15Active || m30Active
   };
-  early.pass = Object.values(early).every(Boolean);
-  delete early.pass;
 
   const growing = {
     momentum: h1 >= 3 || h6 >= 5 || m15.change >= 2,
@@ -68,7 +62,20 @@ export function stageSignals(metrics, previousHistory = []) {
     timeframeBullish: (m15Active && m15Bullish) || (m30Active && m30Bullish),
     confirmation: m15.change >= 0.5 || m30.change >= 0.5 || m15.pressure >= 55 || m30.pressure >= 55
   };
-  growing.pass = Object.values(growing).every(Boolean);
+
+  const healthyM5Pullback =
+    m5 >= -20 &&
+    h1 >= 10 &&
+    m15.change >= 3 &&
+    m30.change >= 1 &&
+    pressure >= 50 &&
+    totalTrades >= 20 &&
+    ((m15Active && m15Bullish) || (m30Active && m30Bullish));
+
+  growing.m5NonNegative = m5 >= 0 || healthyM5Pullback;
+  growing.pressure = pressure >= 55 || healthyM5Pullback;
+  growing.pullbackRecovery = healthyM5Pullback;
+  growing.pass = Object.values(growing).filter((_, i) => i < 7).every(Boolean);
 
   const running = {
     volume: volume1h >= 500,
@@ -113,9 +120,9 @@ export function stageSignals(metrics, previousHistory = []) {
 export function explainStage(metrics, previousHistory = []) {
   const s = stageSignals(metrics, previousHistory);
   if (s.pullback.pass) return { stage: 'PULLBACK', reason: 'Prior active run plus pullback pattern', signals: s };
-  if (s.running.pass) return { stage: 'RUNNING', reason: 'High volume, buy pressure, trade activity and momentum structure', signals: s };
-  if (s.growing.pass) return { stage: 'GROWING', reason: 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
   if (s.early.pass) return { stage: 'EARLY', reason: 'Fresh enough with initial momentum, volume, pressure, trades and timeframe activity', signals: s };
+  if (s.growing.pass) return { stage: 'GROWING', reason: s.growing.pullbackRecovery ? 'Higher-timeframe momentum confirmed despite a healthy M5 pullback' : 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
+  if (s.running.pass) return { stage: 'RUNNING', reason: 'High volume, buy pressure, trade activity and momentum structure', signals: s };
   return { stage: 'STABLE', reason: 'No active stage threshold fully passed', signals: s };
 }
 
