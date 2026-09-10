@@ -399,6 +399,25 @@ function passesFilter(m) {
   return true;
 }
 
+function historySample(m, secured) {
+  return {
+    ts: Date.now(),
+    score: m.score,
+    stage: secured.stage,
+    marketCap: Number(m.marketCap || 0),
+    liquidity: Number(m.liquidity || 0),
+    volume1h: Number(m.volume1h || 0),
+    buys: Number(m.buys || 0),
+    sells: Number(m.sells || 0),
+    pressure: Number(m.pressure || 50),
+    change5m: Number(m.change5m || 0),
+    change15m: Number(m.change15m || 0),
+    change30m: Number(m.change30m || 0),
+    risk: Number(secured.risk || 0),
+    riskLevel: secured.riskLevel || 'PENDING'
+  };
+}
+
 async function scan() {
   const latestBlockPromise = latestBlockNumber();
   const pools = await loadMarketPools();
@@ -416,13 +435,15 @@ async function scan() {
     if (!passesFilter(m)) continue;
     const last = prev[prev.length - 1];
     if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score || last.stage !== m.stage) {
-      history.set(key, [...prev, { ts: Date.now(), score: m.score, stage: m.stage }].slice(-24));
+      history.set(key, [...prev, historySample(m, applyRisk({ ...m, history: prev }, { holders: null }) )].slice(-60));
     }
     const cachedSecurity = contractCache.get(key)?.data || {};
     const cachedScout = scoutCache.get(key)?.data;
     const holderFromCache = scoutInfo(cachedScout).holders;
     const metrics = applyRisk({ ...m, history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });
-    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...metrics, verified: cachedSecurity.verified ?? null, contractExists: cachedSecurity.contractExists ?? null, proxy: cachedSecurity.proxy ?? null, holders: holderFromCache, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
+    const h = history.get(key) || [];
+    if (h.length) h[h.length - 1] = historySample(m, metrics);
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...metrics, verified: cachedSecurity.verified ?? null, contractExists: cachedSecurity.contractExists ?? null, proxy: cachedSecurity.proxy ?? null, holders: holderFromCache, pool: p.pool, dex: p.dex, history: h });
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
@@ -471,7 +492,7 @@ app.get('/api/token/:address', async (req, res) => {
     const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
     const key = address.toLowerCase();
     const metrics = applyRisk({ ...scorePool(best, history.get(key) || []), history: history.get(key) || [] }, { holders, ...contract });
-    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score, stage: metrics.stage }].slice(-24));
+    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score, stage: metrics.stage }].slice(-60));
     res.json({ ...meta, ...metrics, holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
