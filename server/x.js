@@ -85,7 +85,8 @@ async function refreshAccessToken() {
       method: 'POST',
       headers: {
         authorization: `Basic ${basic}`,
-        'content-type': 'application/x-www-form-urlencoded'
+        'content-type': 'application/x-www-form-urlencoded',
+        accept: 'application/json'
       },
       body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
       signal: AbortSignal.timeout(8000)
@@ -108,13 +109,18 @@ async function postToX(text, retry = true) {
     method: 'POST',
     headers: {
       authorization: `Bearer ${accessToken}`,
-      'content-type': 'application/json'
+      'content-type': 'application/json',
+      accept: 'application/json'
     },
     body: JSON.stringify({ text }),
     signal: AbortSignal.timeout(8000)
   });
 
-  if (response.status === 401 && retry && refreshToken) {
+  if ((response.status === 401 || response.status === 403) && retry && refreshToken) {
+    const body = await response.text();
+    if (response.status === 403 && !/Unsupported Authentication|Application-Only/i.test(body)) {
+      throw new Error(`X API ${response.status}: ${body.slice(0, 300)}`);
+    }
     await refreshAccessToken();
     return postToX(text, false);
   }
