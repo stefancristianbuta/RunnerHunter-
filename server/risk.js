@@ -52,7 +52,9 @@ export function classifyStage(metrics, previousHistory = []) {
   const growing =
     (h1 >= 3 || h6 >= 5 || m15.change >= 2) &&
     m5 >= 0 && volume1h >= 100 && pressure >= 55 &&
-    (m15Bullish || m30Bullish) && totalTrades >= 4;
+    totalTrades >= 4 &&
+    ((m15Active && m15Bullish) || (m30Active && m30Bullish)) &&
+    (m15.change >= 0.5 || m30.change >= 0.5 || m15.pressure >= 55 || m30.pressure >= 55);
 
   const running = volume1h >= 500 && pressure >= 60 && totalTrades >= 6 &&
     ((h1 >= 10 || h6 >= 20) && m15Strong && m30Strong ||
@@ -68,9 +70,9 @@ export function classifyStage(metrics, previousHistory = []) {
   );
 
   if (pullback) return 'PULLBACK';
-  if (early) return 'EARLY';
   if (running) return 'RUNNING';
   if (growing) return 'GROWING';
+  if (early) return 'EARLY';
   return 'STABLE';
 }
 
