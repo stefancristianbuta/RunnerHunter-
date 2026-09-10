@@ -1,6 +1,7 @@
 import { queueSecurity, securitySnapshot } from './security.js';
 
 const clamp = (n, min = 0, max = 100) => Math.max(min, Math.min(max, Number(n) || 0));
+const EARLY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 export function assessRisk(metrics, security = {}) {
   const marketCap = Number(metrics?.marketCap || 0);
@@ -64,5 +65,29 @@ export function assessRisk(metrics, security = {}) {
 
 export function applyRisk(metrics, security = {}) {
   const result = assessRisk(metrics, security);
-  return { ...metrics, ...result, stage: metrics.stage || 'STABLE' };
+  const h1 = Number(metrics?.change1h || 0);
+  const h6 = Number(metrics?.change6h || 0);
+  const m5 = Number(metrics?.change5m || 0);
+  const volume1h = Number(metrics?.volume1h || 0);
+  const pressure = Number(metrics?.pressure || 50);
+  const totalTrades = Number(metrics?.buys || 0) + Number(metrics?.sells || 0);
+  const ageMs = Number(metrics?.ageMs);
+  const wasPullback = metrics?.stage === 'PULLBACK';
+
+  // Stage classification is momentum-first. Score ranks candidates; it does not
+  // demote a token with clear market momentum into STABLE.
+  const early = Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS &&
+    (h1 > 2 || m5 > 1) && volume1h >= 100 && pressure >= 55 && totalTrades >= 3;
+  const running = (h1 >= 10 || h6 >= 20 || m5 >= 2) &&
+    volume1h >= 500 && pressure >= 60;
+  const growing = (h1 >= 3 || h6 >= 5) &&
+    m5 >= 0 && volume1h >= 100 && pressure >= 55;
+
+  let stage = 'STABLE';
+  if (wasPullback) stage = 'PULLBACK';
+  else if (early) stage = 'EARLY';
+  else if (running) stage = 'RUNNING';
+  else if (growing) stage = 'GROWING';
+
+  return { ...metrics, ...result, stage };
 }
