@@ -44,7 +44,6 @@ function eligible(item) {
   const m15Pressure = Number(input.m15Pressure || 0);
   const m30Pressure = Number(input.m30Pressure || 0);
 
-  // Temporary test gate: keep both timeframes confirmed, but use lighter activity requirements.
   const confirmed15 = m15Trades >= 2 && (m15 >= -1 || m15Pressure >= 52);
   const confirmed30 = m30Trades >= 2 && (m30 >= -1 || m30Pressure >= 52);
   if (!confirmed15 || !confirmed30) return false;
@@ -81,7 +80,8 @@ async function refreshAccessToken() {
   if (refreshInFlight) return refreshInFlight;
 
   refreshInFlight = (async () => {
-    const basic = Buffer.from(`${process.env.X_CLIENT_ID}:${process.env.X_CLIENT_SECRET}`).toString('base64');
+    const clientId = process.env.X_CLIENT_ID;
+    const basic = Buffer.from(`${clientId}:${process.env.X_CLIENT_SECRET}`).toString('base64');
     const response = await fetch(X_TOKEN_URL, {
       method: 'POST',
       headers: {
@@ -89,7 +89,11 @@ async function refreshAccessToken() {
         'content-type': 'application/x-www-form-urlencoded',
         accept: 'application/json'
       },
-      body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        refresh_token: refreshToken,
+        client_id: clientId
+      }),
       signal: AbortSignal.timeout(8000)
     });
     const body = await response.text();
