@@ -2,6 +2,7 @@ import express from 'express';
 import { JsonRpcProvider } from 'ethers';
 import { publishEligibleRunner, xStatus } from './x.js';
 import { installXOauth } from './x-oauth.js';
+import { recordTelemetry, telemetrySnapshot } from './telemetry.js';
 
 const nativeSetInterval = globalThis.setInterval.bind(globalThis);
 const nativeGetBlockNumber = JsonRpcProvider.prototype.getBlockNumber;
@@ -9,7 +10,6 @@ const nativeFetch = globalThis.fetch.bind(globalThis);
 const holderCache = new Map();
 const HOLDER_CACHE_MS = 10 * 60 * 1000;
 
-// Keep the non-critical latest-block telemetry from blocking a scan when an RPC is unhealthy.
 JsonRpcProvider.prototype.getBlockNumber = function (...args) {
   return Promise.race([
     nativeGetBlockNumber.apply(this, args),
@@ -77,9 +77,6 @@ function jsonResponse(data) {
   });
 }
 
-// The Robinhood Blockscout API is currently returning HTTP 403 from the runtime.
-// Intercept token enrichment and provide holder_count from a public Robinhood explorer
-// instead, so holder data remains available and 403s never enter scanner warnings.
 const wrappedFetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input?.url || '';
   const tokenMatch = url.match(/https?:\/\/[^/]+\/api\/v2\/tokens\/(0x[a-fA-F0-9]{40})(?:\/(counters))?$/);
@@ -94,21 +91,23 @@ const wrappedFetch = async (input, init) => {
 
 globalThis.fetch = wrappedFetch;
 
-// The market scanner was designed around a 30s loop. Run it at 10s so fresh momentum
-// is not stale while leaving unrelated timers untouched.
 globalThis.setInterval = (fn, delay, ...args) =>
   nativeSetInterval(fn, delay === 30000 ? 10000 : delay, ...args);
 
-// Install the OAuth routes immediately before Express starts listening. The installer
-// moves them ahead of the SPA catch-all so /auth/x/* is never swallowed by index.html.
 const nativeListen = express.application.listen;
 express.application.listen = function (...args) {
   installXOauth(this);
+  this.get('/api/telemetry', (req, res) => {
+    try {
+      const token = typeof req.query?.token === 'string' ? req.query.token : '';
+      res.json(telemetrySnapshot(token));
+    } catch (error) {
+      res.status(500).json({ error: error.message });
+    }
+  });
   return nativeListen.apply(this, args);
 };
 
-// X publishing is deliberately isolated from the radar engine. It polls the public
-// radar endpoint and only posts when server-side X gates in x.js all pass.
 async function pollXPublisher() {
   if (!process.env.X_ACCESS_TOKEN) return;
   try {
@@ -120,6 +119,36 @@ async function pollXPublisher() {
     if (!response.ok) return;
     const radar = await response.json();
     for (const item of Array.isArray(radar) ? radar : []) {
+      recordTelemetry({
+        cycle: item.cycle,
+        outcome: 'CANDIDATE',
+        token: item.address,
+        symbol: item.symbol,
+        name: item.name,
+        address: item.address,
+        score: item.score,
+        stage: item.stage,
+        previousStage: item.history?.at(-2)?.stage || null,
+        stageReason: item.stageReason,
+        filterReasons: [],
+        risk: item.risk,
+        riskLevel: item.riskLevel,
+        riskFlags: item.riskFlags,
+        marketCap: item.marketCap,
+        liquidity: item.liquidity,
+        volume1h: item.volume1h,
+        pressure: item.pressure,
+        buys: item.buys,
+        sells: item.sells,
+        ageMs: item.ageMs,
+        change5m: item.change5m,
+        change15m: item.change15m,
+        change30m: item.change30m,
+        change1h: item.change1h,
+        change6h: item.change6h,
+        stageSignals: item.stageSignals,
+        transition: item.history?.at(-2)?.stage !== item.stage
+      });
       const result = await publishEligibleRunner(item);
       if (result.posted) break;
     }
@@ -131,4 +160,4 @@ async function pollXPublisher() {
 nativeSetInterval(pollXPublisher, 15000);
 setTimeout(pollXPublisher, 12000);
 
-console.log(`[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval + X ${xStatus().configured ? 'configured' : 'disabled'} + OAuth PKCE ready`);
+console.log(`[runtime-patch] holder fallback enabled + Blockscout 403 suppressed + 30s->10s scan interval + telemetry tracking/dashboard + X ${xStatus().configured ? 'configured' : 'disabled'} + OAuth PKCE ready`);
