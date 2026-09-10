@@ -4,6 +4,7 @@ const MIN_SCORE = Number(process.env.X_MIN_SCORE || 80);
 const TOKEN_COOLDOWN_MS = Number(process.env.X_TOKEN_COOLDOWN_MS || 2 * 60 * 60 * 1000);
 const GLOBAL_COOLDOWN_MS = Number(process.env.X_GLOBAL_COOLDOWN_MS || 10 * 60 * 1000);
 const MAX_POSTS_PER_DAY = Number(process.env.X_MAX_POSTS_PER_DAY || 12);
+const RATE_LIMIT_BACKOFF_MS = Number(process.env.X_RATE_LIMIT_BACKOFF_MS || 30 * 60 * 1000);
 
 let lastPostAt = 0;
 let postTimes = [];
@@ -11,6 +12,8 @@ const tokenPosts = new Map();
 let accessToken = process.env.X_ACCESS_TOKEN || '';
 let refreshToken = process.env.X_REFRESH_TOKEN || '';
 let refreshInFlight = null;
+let postInFlight = null;
+let rateLimitUntil = 0;
 
 function configured() {
   return Boolean(accessToken);
@@ -49,6 +52,7 @@ function eligible(item) {
   if (!confirmed15 || !confirmed30) return false;
 
   const now = Date.now();
+  if (now < rateLimitUntil) return false;
   const previous = tokenPosts.get(String(item.address || '').toLowerCase()) || 0;
   if (now - previous < TOKEN_COOLDOWN_MS) return false;
   if (now - lastPostAt < GLOBAL_COOLDOWN_MS) return false;
@@ -109,6 +113,10 @@ async function refreshAccessToken() {
 }
 
 async function postToX(text, retry = true) {
+  if (Date.now() < rateLimitUntil) {
+    throw new Error(`X API 429 backoff active until ${new Date(rateLimitUntil).toISOString()}`);
+  }
+
   const response = await fetch(X_POST_URL, {
     method: 'POST',
     headers: {
@@ -130,29 +138,42 @@ async function postToX(text, retry = true) {
   }
 
   const body = await response.text();
+  if (response.status === 429) {
+    const retryAfter = Number(response.headers.get('retry-after') || 0);
+    const retryMs = retryAfter > 0 ? retryAfter * 1000 : RATE_LIMIT_BACKOFF_MS;
+    rateLimitUntil = Date.now() + Math.max(retryMs, RATE_LIMIT_BACKOFF_MS);
+    throw new Error(`X API 429: ${body.slice(0, 300)}; backoff=${Math.round((rateLimitUntil - Date.now()) / 1000)}s`);
+  }
   if (!response.ok) throw new Error(`X API ${response.status}: ${body.slice(0, 300)}`);
   return JSON.parse(body);
 }
 
 export async function publishEligibleRunner(item) {
   if (!eligible(item)) return { posted: false, reason: 'not-eligible' };
+  if (postInFlight) return { posted: false, reason: 'post-in-flight' };
 
   const text = formatPost(item);
   if (text.length > 280) return { posted: false, reason: 'post-too-long' };
 
-  try {
-    const result = await postToX(text);
-    const now = Date.now();
-    const key = String(item.address).toLowerCase();
-    tokenPosts.set(key, now);
-    lastPostAt = now;
-    postTimes.push(now);
-    console.log(`[x] posted ${item.symbol} score=${item.score} stage=${item.stage} id=${result?.data?.id || 'unknown'}`);
-    return { posted: true, id: result?.data?.id || null };
-  } catch (error) {
-    console.error(`[x:error] ${error.message}`);
-    return { posted: false, reason: 'api-error' };
-  }
+  postInFlight = (async () => {
+    try {
+      const result = await postToX(text);
+      const now = Date.now();
+      const key = String(item.address).toLowerCase();
+      tokenPosts.set(key, now);
+      lastPostAt = now;
+      postTimes.push(now);
+      console.log(`[x] posted ${item.symbol} score=${item.score} stage=${item.stage} id=${result?.data?.id || 'unknown'}`);
+      return { posted: true, id: result?.data?.id || null };
+    } catch (error) {
+      console.error(`[x:error] ${error.message}`);
+      return { posted: false, reason: 'api-error' };
+    } finally {
+      postInFlight = null;
+    }
+  })();
+
+  return postInFlight;
 }
 
 export function xStatus() {
@@ -166,6 +187,8 @@ export function xStatus() {
     globalCooldownMinutes: Math.round(GLOBAL_COOLDOWN_MS / 60000),
     postsLast24h: postTimes.length,
     maxPostsPerDay: MAX_POSTS_PER_DAY,
+    rateLimitBackoffActive: now < rateLimitUntil,
+    rateLimitUntil: rateLimitUntil ? new Date(rateLimitUntil).toISOString() : null,
     lastPostAt: lastPostAt ? new Date(lastPostAt).toISOString() : null
   };
 }
