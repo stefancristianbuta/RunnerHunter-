@@ -22,7 +22,11 @@ function tfStats(metrics, key) {
   };
 }
 
-export function classifyStage(metrics, previousHistory = []) {
+function check(value, actual, expected) {
+  return { pass: Boolean(value), actual, expected };
+}
+
+export function stageSignals(metrics, previousHistory = []) {
   const h1 = Number(metrics?.change1h || 0);
   const h6 = Number(metrics?.change6h || 0);
   const m5 = Number(metrics?.change5m || 0);
@@ -44,36 +48,79 @@ export function classifyStage(metrics, previousHistory = []) {
   const m15Weak = m15.change <= -1 || (m15Active && m15.pressure <= 45);
   const m30Weak = m30.change <= -1.5 || (m30Active && m30.pressure <= 45);
 
-  const early = Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS &&
-    (h1 > 2 || m5 > 1 || m15.change > 1) &&
-    volume1h >= 100 && pressure >= 52 && totalTrades >= 3 &&
-    (m5tf.total >= 2 || m15Active || m30Active);
+  const early = {
+    ageValid: Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS,
+    momentum: h1 > 2 || m5 > 1 || m15.change > 1,
+    volume: volume1h >= 100,
+    pressure: pressure >= 52,
+    trades: totalTrades >= 3,
+    timeframeActivity: m5tf.total >= 2 || m15Active || m30Active
+  };
+  early.pass = Object.values(early).every(Boolean);
+  delete early.pass;
 
-  const growing =
-    (h1 >= 3 || h6 >= 5 || m15.change >= 2) &&
-    m5 >= 0 && volume1h >= 100 && pressure >= 55 &&
-    totalTrades >= 4 &&
-    ((m15Active && m15Bullish) || (m30Active && m30Bullish)) &&
-    (m15.change >= 0.5 || m30.change >= 0.5 || m15.pressure >= 55 || m30.pressure >= 55);
+  const growing = {
+    momentum: h1 >= 3 || h6 >= 5 || m15.change >= 2,
+    m5NonNegative: m5 >= 0,
+    volume: volume1h >= 100,
+    pressure: pressure >= 55,
+    trades: totalTrades >= 4,
+    timeframeBullish: (m15Active && m15Bullish) || (m30Active && m30Bullish),
+    confirmation: m15.change >= 0.5 || m30.change >= 0.5 || m15.pressure >= 55 || m30.pressure >= 55
+  };
+  growing.pass = Object.values(growing).every(Boolean);
 
-  const running = volume1h >= 500 && pressure >= 60 && totalTrades >= 6 &&
-    ((h1 >= 10 || h6 >= 20) && m15Strong && m30Strong ||
-      (m5 >= 2 && m15Strong && m30Bullish && (h1 >= 3 || m30.change >= 1)));
+  const running = {
+    volume: volume1h >= 500,
+    pressure: pressure >= 60,
+    trades: totalTrades >= 6,
+    momentumStructure: ((h1 >= 10 || h6 >= 20) && m15Strong && m30Strong) ||
+      (m5 >= 2 && m15Strong && m30Bullish && (h1 >= 3 || m30.change >= 1))
+  };
+  running.pass = Object.values(running).every(Boolean);
 
   const hadPriorRun = previousHistory.some(x => ['EARLY', 'GROWING', 'RUNNING'].includes(x.stage)) ||
     previousHistory.some(x => Number(x.score) >= 68);
 
-  const pullback = hadPriorRun && (
-    (h1 < -3 && m5 < 0 && (m15Weak || m30Weak)) ||
-    (m15.change <= -1.5 && m30.change < 0 && m15Active && m30Active) ||
-    (m5 <= -2 && m15Weak && m5tf.total >= 3)
-  );
+  const pullback = {
+    priorRun: hadPriorRun,
+    sharpH1: h1 < -3,
+    negativeM5: m5 < 0,
+    weakTf: m15Weak || m30Weak,
+    fullTfPullback: m15.change <= -1.5 && m30.change < 0 && m15Active && m30Active,
+    fastPullback: m5 <= -2 && m15Weak && m5tf.total >= 3
+  };
+  const pullbackPass = pullback.priorRun && ((pullback.sharpH1 && pullback.negativeM5 && pullback.weakTf) || pullback.fullTfPullback || pullback.fastPullback);
 
-  if (pullback) return 'PULLBACK';
-  if (running) return 'RUNNING';
-  if (growing) return 'GROWING';
-  if (early) return 'EARLY';
-  return 'STABLE';
+  return {
+    inputs: {
+      ageMs: Number.isFinite(ageMs) ? ageMs : null,
+      ageHours: Number.isFinite(ageMs) ? Math.round(ageMs / 3600000 * 100) / 100 : null,
+      h1, h6, m5, m15: m15.change, m30: m30.change,
+      volume1h, pressure, totalTrades,
+      m5Trades: m5tf.total, m15Trades: m15.total, m30Trades: m30.total,
+      m15Pressure: Math.round(m15.pressure * 10) / 10,
+      m30Pressure: Math.round(m30.pressure * 10) / 10
+    },
+    early: { ...early, pass: Object.values(early).every(Boolean) },
+    growing,
+    running,
+    pullback: { ...pullback, pass: pullbackPass },
+    hadPriorRun
+  };
+}
+
+export function explainStage(metrics, previousHistory = []) {
+  const s = stageSignals(metrics, previousHistory);
+  if (s.pullback.pass) return { stage: 'PULLBACK', reason: 'Prior active run plus pullback pattern', signals: s };
+  if (s.running.pass) return { stage: 'RUNNING', reason: 'High volume, buy pressure, trade activity and momentum structure', signals: s };
+  if (s.growing.pass) return { stage: 'GROWING', reason: 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
+  if (s.early.pass) return { stage: 'EARLY', reason: 'Fresh enough with initial momentum, volume, pressure, trades and timeframe activity', signals: s };
+  return { stage: 'STABLE', reason: 'No active stage threshold fully passed', signals: s };
+}
+
+export function classifyStage(metrics, previousHistory = []) {
+  return explainStage(metrics, previousHistory).stage;
 }
 
 export function assessRisk(metrics, security = {}) {
@@ -139,6 +186,6 @@ export function assessRisk(metrics, security = {}) {
 export function applyRisk(metrics, security = {}) {
   const result = assessRisk(metrics, security);
   const previousHistory = Array.isArray(metrics?.history) ? metrics.history : [];
-  const stage = classifyStage(metrics, previousHistory);
-  return { ...metrics, ...result, stage };
+  const stageInfo = explainStage(metrics, previousHistory);
+  return { ...metrics, ...result, stage: stageInfo.stage, stageReason: stageInfo.reason, stageSignals: stageInfo.signals };
 }
