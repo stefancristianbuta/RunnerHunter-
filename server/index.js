@@ -21,6 +21,7 @@ const WETH = '0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73'.toLowerCase();
 const USDG = '0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168'.toLowerCase();
 const MULTICALL3 = '0xcA11bde05977b3631167028862bE2a173976CA11';
 const STABLE = new Set(['WETH', 'USDG', 'USDC', 'USDT', 'DAI', 'USDE']);
+const EARLY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 const erc20 = new Interface([
   'function name() view returns (string)',
   'function symbol() view returns (string)',
@@ -332,7 +333,15 @@ async function loadMarketPools(force = false) {
 }
 
 const n = (x, k) => Number(x?.[k] || 0);
-function scorePool(p) {
+function poolAgeMs(createdAt) {
+  if (!createdAt) return null;
+  const ts = Date.parse(createdAt);
+  if (!Number.isFinite(ts)) return null;
+  const age = Date.now() - ts;
+  return age >= 0 ? age : 0;
+}
+
+function scorePool(p, previousHistory = []) {
   const h1 = p.tx.h1, h24 = p.tx.h24, m5 = p.tx.m5;
   const buys = n(h1, 'buys'), sells = n(h1, 'sells'), buyers = n(h1, 'buyers'), sellers = n(h1, 'sellers');
   const total = buys + sells;
@@ -345,9 +354,22 @@ function scorePool(p) {
   const organic = Math.round(Math.min(100, buyers / Math.max(buys, 1) * 100) * 0.18 + Math.min(100, sellers / Math.max(sells, 1) * 100) * 0.12 + participation * 0.22 + liquidityScore * 0.20 + balance * 0.18 + Math.min(100, Math.log10(Math.max(n(h24, 'buys') + n(h24, 'sells'), 1)) * 15) * 0.10);
   const acceleration = Math.max(0, Math.min(100, 45 + p.changes.m5 * 2.2 + (n(m5, 'buys') + n(m5, 'sells')) * 2));
   const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);
-  let stage = score >= 82 ? 'RUNNING' : score >= 68 ? 'GROWING' : score >= 52 ? 'EARLY' : 'PULLBACK';
-  if (p.changes.h1 < -8 && p.changes.m5 < 0) stage = 'PULLBACK';
-  return { marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity, buys, sells, buyers, sellers, buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100, pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score, stage, volume1h: p.volume.h1, volume24h: p.volume.h24, change5m: p.changes.m5, change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24, age: p.createdAt };
+
+  const ageMs = poolAgeMs(p.createdAt);
+  const ageHours = ageMs == null ? null : ageMs / (60 * 60 * 1000);
+  const hasEarlyMomentum = (p.changes.h1 > 2 || p.changes.m5 > 1) && p.volume.h1 >= 100 && pressure >= 55 && total >= 3;
+  const hasGrowingMomentum = (p.changes.h1 >= 3 || p.changes.h6 >= 5) && p.changes.m5 >= 0 && p.volume.h1 >= 100 && pressure >= 55;
+  const hasRunningMomentum = (p.changes.h1 >= 10 || p.changes.h6 >= 20 || p.changes.m5 >= 2) && p.volume.h1 >= 500 && pressure >= 60;
+  const hadPriorRun = previousHistory.some(x => ['EARLY', 'GROWING', 'RUNNING'].includes(x.stage)) || previousHistory.some(x => Number(x.score) >= 68);
+  const isPullback = hadPriorRun && p.changes.h1 < -3 && p.changes.m5 < 0;
+
+  let stage = 'STABLE';
+  if (ageMs != null && ageMs <= EARLY_MAX_AGE_MS && score >= 52 && hasEarlyMomentum) stage = 'EARLY';
+  else if (hasRunningMomentum && score >= 82) stage = 'RUNNING';
+  else if (hasGrowingMomentum && score >= 68) stage = 'GROWING';
+  else if (isPullback) stage = 'PULLBACK';
+
+  return { marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity, buys, sells, buyers, sellers, buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100, pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score, stage, volume1h: p.volume.h1, volume24h: p.volume.h24, change5m: p.changes.m5, change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24, age: p.createdAt, ageMs, ageHours: ageHours == null ? null : Math.round(ageHours * 100) / 100 };
 }
 
 function passesFilter(m) {
@@ -370,12 +392,14 @@ async function scan() {
   const discovered = [...byToken.values()];
   const results = [];
   for (const p of discovered.slice(0, 120)) {
-    const m = scorePool(p);
-    if (!passesFilter(m)) continue;
     const key = p.token.toLowerCase();
     const prev = history.get(key) || [];
+    const m = scorePool(p, prev);
+    if (!passesFilter(m)) continue;
     const last = prev[prev.length - 1];
-    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score) history.set(key, [...prev, { ts: Date.now(), score: m.score }].slice(-24));
+    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score || last.stage !== m.stage) {
+      history.set(key, [...prev, { ts: Date.now(), score: m.score, stage: m.stage }].slice(-24));
+    }
     const cachedSecurity = contractCache.get(key)?.data || {};
     const cachedScout = scoutCache.get(key)?.data;
     const holderFromCache = scoutInfo(cachedScout).holders;
@@ -384,7 +408,7 @@ async function scan() {
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
-  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.score >= 52 && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
+  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.stage !== 'STABLE' && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
   radar = results;
   void enrichRadar(results);
   console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} flagged=${state.flagged} top=${results[0]?.symbol || 'none'}`);
@@ -424,11 +448,11 @@ app.get('/api/token/:address', async (req, res) => {
     let pools = null;
     try { pools = await gecko(`/networks/robinhood/tokens/${address}/pools?include=base_token,quote_token,dex`); } catch { pools = null; }
     const normalized = pools ? (pools?.data || []).map(x => normalizePool(x, includedTokenMap(pools))).filter(Boolean).slice(0, 10) : [];
-    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'EARLY', risk: 100, riskLevel: 'REVIEW', riskFlags: ['No active market pool found'], history: history.get(address.toLowerCase()) || [] });
+    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'STABLE', risk: 100, riskLevel: 'REVIEW', riskFlags: ['No active market pool found'], history: history.get(address.toLowerCase()) || [] });
     const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
-    const metrics = applyRisk(scorePool(best), { holders, ...contract });
     const key = address.toLowerCase();
-    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score }].slice(-24));
+    const metrics = applyRisk(scorePool(best, history.get(key) || []), { holders, ...contract });
+    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score, stage: metrics.stage }].slice(-24));
     res.json({ ...meta, ...metrics, holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
