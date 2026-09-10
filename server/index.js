@@ -2,7 +2,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'url';
 import { JsonRpcProvider, Interface, getAddress } from 'ethers';
-import { applyRisk } from './risk.js';
+import { applyRisk, classifyStage } from './risk.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -46,7 +46,7 @@ const started = Date.now();
 let state = {
   status: 'STARTING', lastUpdate: null, scanCycle: 0, discovered: 0,
   analyzed: 0, active: 0, errors: 0, flagged: 0, warnings: [], latestBlock: null,
-  uptime: 0, source: 'GeckoTerminal + multi-RPC + Blockscout'
+  uptime: 0, timeframeCoverage: 0, source: 'GeckoTerminal + multi-RPC + Blockscout'
 };
 
 async function withRpc(task) {
@@ -245,14 +245,25 @@ function normalizePool(item, included) {
   const token = baseStable ? quote : base;
   if (!token?.address || token.address === WETH || token.address === USDG) return null;
   const tx = a.transactions || {}, pc = a.price_change_percentage || {}, vol = a.volume_usd || {};
+  const changes = { m5: Number(pc.m5 || 0), m15: Number(pc.m15 || 0), m30: Number(pc.m30 || 0), h1: Number(pc.h1 || 0), h6: Number(pc.h6 || 0), h24: Number(pc.h24 || 0) };
+  const volume = { m5: Number(vol.m5 || 0), m15: Number(vol.m15 || 0), m30: Number(vol.m30 || 0), h1: Number(vol.h1 || 0), h6: Number(vol.h6 || 0), h24: Number(vol.h24 || 0) };
+  const transactions = { m5: tx.m5 || {}, m15: tx.m15 || {}, m30: tx.m30 || {}, h1: tx.h1 || {}, h6: tx.h6 || {}, h24: tx.h24 || {} };
   return {
     pool: String(a.address || '').toLowerCase(), dex: rel.dex?.data?.id || 'unknown',
     token: token.address.toLowerCase(), name: token.name || 'Unknown', symbol: token.symbol || '?',
     image: token.image_url || '', price: Number(a.base_token_price_usd || a.token_price_usd || 0),
     marketCap: Number(a.market_cap_usd || 0), fdv: Number(a.fdv_usd || 0), liquidity: Number(a.reserve_in_usd || 0),
-    changes: { m5: Number(pc.m5 || 0), h1: Number(pc.h1 || 0), h6: Number(pc.h6 || 0), h24: Number(pc.h24 || 0) },
-    tx: { m5: tx.m5 || {}, h1: tx.h1 || {}, h6: tx.h6 || {}, h24: tx.h24 || {} },
-    volume: { m5: Number(vol.m5 || 0), h1: Number(vol.h1 || 0), h6: Number(vol.h6 || 0), h24: Number(vol.h24 || 0) },
+    changes,
+    tx: transactions,
+    volume,
+    timeframeData: {
+      m5: Number.isFinite(changes.m5) && Object.keys(transactions.m5).length > 0,
+      m15: Number.isFinite(changes.m15) && Object.keys(transactions.m15).length > 0,
+      m30: Number.isFinite(changes.m30) && Object.keys(transactions.m30).length > 0,
+      h1: Number.isFinite(changes.h1) && Object.keys(transactions.h1).length > 0,
+      h6: Number.isFinite(changes.h6) && Object.keys(transactions.h6).length > 0,
+      h24: Number.isFinite(changes.h24) && Object.keys(transactions.h24).length > 0
+    },
     createdAt: a.pool_created_at || null
   };
 }
@@ -346,30 +357,37 @@ function scorePool(p, previousHistory = []) {
   const buys = n(h1, 'buys'), sells = n(h1, 'sells'), buyers = n(h1, 'buyers'), sellers = n(h1, 'sellers');
   const total = buys + sells;
   const pressure = total ? buys / total * 100 : 50;
+  const m15 = p.tx.m15 || {}, m30 = p.tx.m30 || {};
+  const m15Total = n(m15, 'buys') + n(m15, 'sells');
+  const m30Total = n(m30, 'buys') + n(m30, 'sells');
+  const m15Pressure = m15Total ? n(m15, 'buys') / m15Total * 100 : 50;
+  const m30Pressure = m30Total ? n(m30, 'buys') / m30Total * 100 : 50;
   const participation = Math.min(100, Math.log10(Math.max(buyers + sellers, 1)) * 22);
   const liquidityScore = Math.min(100, Math.log10(Math.max(p.liquidity, 1)) * 14);
   const volumeLiquidity = Math.min(100, p.volume.h1 / Math.max(p.liquidity, 1) * 250);
-  const momentum = Math.max(0, Math.min(100, 35 + p.changes.m5 * 1.5 + p.changes.h1 * 0.55 + p.changes.h6 * 0.12 + volumeLiquidity * 0.22 + participation * 0.18));
+  const timeframeMomentum = Math.min(100, Math.max(0, 50 + p.changes.m15 * 0.7 + p.changes.m30 * 0.9 + (m15Pressure - 50) * 0.35 + (m30Pressure - 50) * 0.45));
+  const momentum = Math.max(0, Math.min(100, 35 + p.changes.m5 * 1.4 + p.changes.m15 * 0.35 + p.changes.m30 * 0.45 + p.changes.h1 * 0.5 + p.changes.h6 * 0.12 + volumeLiquidity * 0.20 + participation * 0.16 + timeframeMomentum * 0.10));
   const balance = 100 - Math.min(100, Math.abs(buys - sells) / Math.max(total, 1) * 100);
   const organic = Math.round(Math.min(100, buyers / Math.max(buys, 1) * 100) * 0.18 + Math.min(100, sellers / Math.max(sells, 1) * 100) * 0.12 + participation * 0.22 + liquidityScore * 0.20 + balance * 0.18 + Math.min(100, Math.log10(Math.max(n(h24, 'buys') + n(h24, 'sells'), 1)) * 15) * 0.10);
-  const acceleration = Math.max(0, Math.min(100, 45 + p.changes.m5 * 2.2 + (n(m5, 'buys') + n(m5, 'sells')) * 2));
+  const acceleration = Math.max(0, Math.min(100, 45 + p.changes.m5 * 2.0 + p.changes.m15 * 0.7 + (n(m5, 'buys') + n(m5, 'sells')) * 2));
   const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);
 
   const ageMs = poolAgeMs(p.createdAt);
   const ageHours = ageMs == null ? null : ageMs / (60 * 60 * 1000);
-  const hasEarlyMomentum = (p.changes.h1 > 2 || p.changes.m5 > 1) && p.volume.h1 >= 100 && pressure >= 55 && total >= 3;
-  const hasGrowingMomentum = (p.changes.h1 >= 3 || p.changes.h6 >= 5) && p.changes.m5 >= 0 && p.volume.h1 >= 100 && pressure >= 55;
-  const hasRunningMomentum = (p.changes.h1 >= 10 || p.changes.h6 >= 20 || p.changes.m5 >= 2) && p.volume.h1 >= 500 && pressure >= 60;
-  const hadPriorRun = previousHistory.some(x => ['EARLY', 'GROWING', 'RUNNING'].includes(x.stage)) || previousHistory.some(x => Number(x.score) >= 68);
-  const isPullback = hadPriorRun && p.changes.h1 < -3 && p.changes.m5 < 0;
-
-  let stage = 'STABLE';
-  if (ageMs != null && ageMs <= EARLY_MAX_AGE_MS && score >= 52 && hasEarlyMomentum) stage = 'EARLY';
-  else if (hasRunningMomentum && score >= 82) stage = 'RUNNING';
-  else if (hasGrowingMomentum && score >= 68) stage = 'GROWING';
-  else if (isPullback) stage = 'PULLBACK';
-
-  return { marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity, buys, sells, buyers, sellers, buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100, pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score, stage, volume1h: p.volume.h1, volume24h: p.volume.h24, change5m: p.changes.m5, change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24, age: p.createdAt, ageMs, ageHours: ageHours == null ? null : Math.round(ageHours * 100) / 100 };
+  const metrics = {
+    marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity,
+    buys, sells, buyers, sellers,
+    buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100,
+    pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score,
+    volume1h: p.volume.h1, volume24h: p.volume.h24,
+    change5m: p.changes.m5, change15m: p.changes.m15, change30m: p.changes.m30,
+    change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24,
+    volume: p.volume, tx: p.tx, changes: p.changes, timeframeData: p.timeframeData,
+    age: p.createdAt, ageMs, ageHours: ageHours == null ? null : Math.round(ageHours * 100) / 100,
+    history: previousHistory
+  };
+  metrics.stage = classifyStage(metrics, previousHistory);
+  return metrics;
 }
 
 function passesFilter(m) {
@@ -403,15 +421,16 @@ async function scan() {
     const cachedSecurity = contractCache.get(key)?.data || {};
     const cachedScout = scoutCache.get(key)?.data;
     const holderFromCache = scoutInfo(cachedScout).holders;
-    const metrics = applyRisk(m, { holders: holderFromCache, ...cachedSecurity });
+    const metrics = applyRisk({ ...m, history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });
     results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...metrics, verified: cachedSecurity.verified ?? null, contractExists: cachedSecurity.contractExists ?? null, proxy: cachedSecurity.proxy ?? null, holders: holderFromCache, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
   }
   results.sort((a, b) => b.score - a.score);
   const latestBlock = await latestBlockPromise;
-  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.stage !== 'STABLE' && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0 };
+  const timeframeReady = discovered.length ? discovered.filter(p => p.timeframeData?.m15 && p.timeframeData?.m30).length / discovered.length * 100 : 0;
+  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.stage !== 'STABLE' && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0, timeframeCoverage: Math.round(timeframeReady) };
   radar = results;
   void enrichRadar(results);
-  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} flagged=${state.flagged} top=${results[0]?.symbol || 'none'}`);
+  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} flagged=${state.flagged} tf15/30=${state.timeframeCoverage}% top=${results[0]?.symbol || 'none'}`);
 }
 
 async function safeScan() {
@@ -430,7 +449,7 @@ app.use(express.json());
 app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
 app.get('/api/status', (req, res) => res.json(state));
 app.get('/api/radar', (req, res) => res.json(radar));
-app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
 app.get('/api/token/:address', async (req, res) => {
   try {
     const address = getAddress(req.params.address);
@@ -451,7 +470,7 @@ app.get('/api/token/:address', async (req, res) => {
     if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'STABLE', risk: 100, riskLevel: 'REVIEW', riskFlags: ['No active market pool found'], history: history.get(address.toLowerCase()) || [] });
     const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
     const key = address.toLowerCase();
-    const metrics = applyRisk(scorePool(best, history.get(key) || []), { holders, ...contract });
+    const metrics = applyRisk({ ...scorePool(best, history.get(key) || []), history: history.get(key) || [] }, { holders, ...contract });
     history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score, stage: metrics.stage }].slice(-24));
     res.json({ ...meta, ...metrics, holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
   } catch (e) { res.status(400).json({ error: e.message }); }
