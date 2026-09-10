@@ -79,16 +79,408 @@ async function tokenMeta(address) {
       try {
         const result = results[index];
         if (!result?.success) return fallback;
-        return erc20.decodeFunctionResult(method, result.returnData)[0];
+        return erc20.decodeFunctionResult(method, result.returnData)[0] ?? fallback;
       } catch { return fallback; }
     };
-    name = decode(0, 'name', name);
-    symbol = decode(1, 'symbol', symbol);
-    decimals = Number(decode(2, 'decimals', decimals));
-    totalSupply = decode(3, 'totalSupply', totalSupply);
-  } catch {}
-  const meta = { name: String(name), symbol: String(symbol), decimals, totalSupply };
+    name = decode(0, 'name', 'Unknown');
+    symbol = decode(1, 'symbol', '?');
+    decimals = decode(2, 'decimals', 18);
+    totalSupply = decode(3, 'totalSupply', 0n);
+  } catch {
+    const call = async method => { try { return await withRpc(p => p.call({ to: address, data: erc20.encodeFunctionData(method) })); } catch { return null; } };
+    const decodeFallback = async (method, fallback) => { const raw = await call(method); if (raw == null) return fallback; try { return erc20.decodeFunctionResult(method, raw)[0]; } catch { return fallback; } };
+    [name, symbol, decimals, totalSupply] = await Promise.all([
+      decodeFallback('name', 'Unknown'), decodeFallback('symbol', '?'), decodeFallback('decimals', 18), decodeFallback('totalSupply', 0n)
+    ]);
+  }
+  const meta = { address: getAddress(address), name: String(name || 'Unknown'), symbol: String(symbol || '?'), decimals: Number(decimals || 18), totalSupply: String(totalSupply || 0n) };
   metaCache.set(key, meta);
   return meta;
 }
 
+async function latestBlockNumber() {
+  try { return await withRpc(p => p.getBlockNumber()); }
+  catch (e) { state.warnings = [...state.warnings, `RPC: ${e.message}`].slice(-10); return null; }
+}
+
+async function blockscoutToken(address) {
+  const key = address.toLowerCase();
+  const cached = scoutCache.get(key);
+  if (cached && Date.now() - cached.at < 5 * 60 * 1000) return cached.data;
+  try {
+    const r = await fetch(`${BLOCKSCOUT}/tokens/${address}`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
+    if (!r.ok) throw new Error(`Blockscout ${r.status}`);
+    const data = await r.json();
+    scoutCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch (e) {
+    state.warnings = [...state.warnings, `Blockscout ${address}: ${e.message}`].slice(-10);
+    if (cached) return cached.data;
+    scoutCache.set(key, { at: Date.now(), data: null });
+    return null;
+  }
+}
+
+async function blockscoutCounters(address) {
+  try {
+    const r = await fetch(`${BLOCKSCOUT}/tokens/${address}/counters`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+async function blockscoutContract(address) {
+  const key = address.toLowerCase();
+  const cached = contractCache.get(key);
+  if (cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.data;
+  try {
+    const r = await fetch(`${BLOCKSCOUT}/smart-contracts/${address}`, { signal: AbortSignal.timeout(4500), headers: { accept: 'application/json' } });
+    if (r.status === 404) {
+      const data = { verified: false, contractExists: true, proxy: false, name: null };
+      contractCache.set(key, { at: Date.now(), data });
+      return data;
+    }
+    if (!r.ok) throw new Error(`Blockscout contract ${r.status}`);
+    const raw = await r.json();
+    const data = { verified: raw?.is_verified === true, contractExists: true, proxy: Boolean(raw?.minimal_proxy_address_hash || raw?.implementation_address_hash), name: raw?.name || null };
+    contractCache.set(key, { at: Date.now(), data });
+    return data;
+  } catch {
+    const data = { verified: null, contractExists: null, proxy: null, name: null };
+    contractCache.set(key, { at: Date.now(), data });
+    return data;
+  }
+}
+
+function scoutInfo(scout) {
+  if (!scout) return { holders: null, image: '' };
+  const rawHolders = scout.holders_count ?? scout.holders ?? scout.holder_count ?? scout.token_holders_count;
+  const holders = rawHolders == null ? null : Number(rawHolders);
+  const image = scout.icon_url || scout.image_url || scout.metadata?.logo || scout.metadata?.image || '';
+  return { holders: Number.isFinite(holders) && holders >= 0 ? holders : null, image: typeof image === 'string' ? image : '' };
+}
+
+async function enrichRadar(results) {
+  if (enriching) return;
+  enriching = true;
+  try {
+    const targets = results.slice(0, 30);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(4, targets.length) }, async () => {
+      while (cursor < targets.length) {
+        const item = results[cursor++];
+        const [scout, contract] = await Promise.all([blockscoutToken(item.address), blockscoutContract(item.address)]);
+        const info = scoutInfo(scout);
+        let holders = info.holders;
+        if (holders == null) {
+          const counters = await blockscoutCounters(item.address);
+          const n = Number(counters?.token_holders_count);
+          if (Number.isFinite(n)) holders = n;
+        }
+        const current = radar.find(x => x.address.toLowerCase() === item.address.toLowerCase()) || item;
+        current.holders = holders;
+        current.verified = contract?.verified ?? null;
+        current.contractExists = contract?.contractExists ?? null;
+        current.proxy = contract?.proxy ?? null;
+        const secured = applyRisk(current, { holders, ...contract });
+        current.risk = secured.risk;
+        current.riskLevel = secured.riskLevel;
+        current.riskFlags = secured.riskFlags;
+        current.marketLiquidityRatio = secured.marketLiquidityRatio;
+        if (secured.stage !== current.stage) current.stage = secured.stage;
+        current.image = info.image || current.image || '';
+      }
+    });
+    await Promise.all(workers);
+  } finally { enriching = false; }
+}
+
+let geckoNextAllowedAt = 0;
+let geckoBlockedUntil = 0;
+let geckoQueue = Promise.resolve();
+function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function gecko(pathname) {
+  const run = async () => {
+    if (Date.now() < geckoBlockedUntil) throw new Error('GeckoTerminal rate-limit cooldown');
+    const delay = Math.max(0, geckoNextAllowedAt - Date.now());
+    if (delay) await wait(delay);
+    geckoNextAllowedAt = Date.now() + 6500;
+    const r = await fetch(`${GECKO}${pathname}`, { headers: { accept: 'application/json;version=20230203' }, signal: AbortSignal.timeout(8000) });
+    if (r.status === 429) {
+      const retry = Number(r.headers.get('retry-after') || 60);
+      geckoBlockedUntil = Date.now() + Math.max(60, retry) * 1000;
+      throw new Error(`GeckoTerminal 429; cooldown ${Math.max(60, retry)}s`);
+    }
+    if (!r.ok) throw new Error(`GeckoTerminal ${r.status}`);
+    return r.json();
+  };
+  const result = geckoQueue.then(run, run);
+  geckoQueue = result.catch(() => undefined);
+  return result;
+}
+
+function addressFromResourceId(id) {
+  if (!id) return null;
+  const s = String(id).split('_').pop();
+  return /^0x[a-f0-9]{40}$/i.test(s) ? s.toLowerCase() : null;
+}
+
+function includedTokenMap(payload) {
+  const map = new Map();
+  for (const item of payload?.included || []) {
+    if (item?.type !== 'token') continue;
+    const address = String(item.attributes?.address || addressFromResourceId(item.id) || '').toLowerCase();
+    if (address) map.set(String(item.id), { address, ...item.attributes });
+  }
+  return map;
+}
+
+function normalizePool(item, included) {
+  const a = item?.attributes || {};
+  const rel = item?.relationships || {};
+  const base = included.get(rel.base_token?.data?.id) || { address: addressFromResourceId(rel.base_token?.data?.id), symbol: '?', name: 'Unknown' };
+  const quote = included.get(rel.quote_token?.data?.id) || { address: addressFromResourceId(rel.quote_token?.data?.id), symbol: '?', name: 'Unknown' };
+  const baseStable = STABLE.has(String(base.symbol || '').toUpperCase()) || base.address === WETH || base.address === USDG;
+  const token = baseStable ? quote : base;
+  if (!token?.address || token.address === WETH || token.address === USDG) return null;
+  const tx = a.transactions || {}, pc = a.price_change_percentage || {}, vol = a.volume_usd || {};
+  const changes = { m5: Number(pc.m5 || 0), m15: Number(pc.m15 || 0), m30: Number(pc.m30 || 0), h1: Number(pc.h1 || 0), h6: Number(pc.h6 || 0), h24: Number(pc.h24 || 0) };
+  const volume = { m5: Number(vol.m5 || 0), m15: Number(vol.m15 || 0), m30: Number(vol.m30 || 0), h1: Number(vol.h1 || 0), h6: Number(vol.h6 || 0), h24: Number(vol.h24 || 0) };
+  const transactions = { m5: tx.m5 || {}, m15: tx.m15 || {}, m30: tx.m30 || {}, h1: tx.h1 || {}, h6: tx.h6 || {}, h24: tx.h24 || {} };
+  return {
+    pool: String(a.address || '').toLowerCase(), dex: rel.dex?.data?.id || 'unknown',
+    token: token.address.toLowerCase(), name: token.name || 'Unknown', symbol: token.symbol || '?',
+    image: token.image_url || '', price: Number(a.base_token_price_usd || a.token_price_usd || 0),
+    marketCap: Number(a.market_cap_usd || 0), fdv: Number(a.fdv_usd || 0), liquidity: Number(a.reserve_in_usd || 0),
+    changes,
+    tx: transactions,
+    volume,
+    timeframeData: {
+      m5: Number.isFinite(changes.m5) && Object.keys(transactions.m5).length > 0,
+      m15: Number.isFinite(changes.m15) && Object.keys(transactions.m15).length > 0,
+      m30: Number.isFinite(changes.m30) && Object.keys(transactions.m30).length > 0,
+      h1: Number.isFinite(changes.h1) && Object.keys(transactions.h1).length > 0,
+      h6: Number.isFinite(changes.h6) && Object.keys(transactions.h6).length > 0,
+      h24: Number.isFinite(changes.h24) && Object.keys(transactions.h24).length > 0
+    },
+    createdAt: a.pool_created_at || null
+  };
+}
+
+const GECKO_ENDPOINTS = [
+  { key: 'new-1', path: '/networks/robinhood/new_pools?page=1&include=base_token,quote_token,dex', minAge: 20000 },
+  { key: 'new-2', path: '/networks/robinhood/new_pools?page=2&include=base_token,quote_token,dex', minAge: 45000 },
+  { key: 'trending-1', path: '/networks/robinhood/trending_pools?page=1&include=base_token,quote_token,dex', minAge: 60000 },
+  { key: 'trending-2', path: '/networks/robinhood/trending_pools?page=2&include=base_token,quote_token,dex', minAge: 120000 },
+  { key: 'pools-1', path: '/networks/robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 90000 },
+  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }
+];
+
+function mergePools(existing, incoming) {
+  const map = new Map(existing.map(p => [`${p.token}:${p.pool}`, p]));
+  for (const p of incoming) {
+    const key = `${p.token}:${p.pool}`;
+    const old = map.get(key);
+    if (!old || p.volume.h1 + p.liquidity >= old.volume.h1 + old.liquidity) map.set(key, p);
+  }
+  return [...map.values()];
+}
+
+async function refreshGeckoEndpoint(source) {
+  const payload = await gecko(source.path);
+  const included = includedTokenMap(payload);
+  const incoming = [];
+  for (const item of payload?.data || []) {
+    const p = normalizePool(item, included);
+    if (p) incoming.push(p);
+  }
+  geckoSources.set(source.key, { at: Date.now(), pools: incoming });
+  return incoming;
+}
+
+function rebuildGeckoCache() {
+  let merged = [];
+  for (const source of GECKO_ENDPOINTS) {
+    const cached = geckoSources.get(source.key);
+    if (cached?.pools?.length) merged = mergePools(merged, cached.pools);
+  }
+  if (merged.length) geckoCache = { at: Date.now(), pools: merged };
+  return geckoCache.pools;
+}
+
+function pickGeckoSource(force = false) {
+  const now = Date.now();
+  const due = GECKO_ENDPOINTS.filter(source => {
+    const cached = geckoSources.get(source.key);
+    return force || !cached || now - cached.at >= source.minAge;
+  });
+  if (!due.length) return null;
+  return due.sort((a, b) => {
+    const ca = geckoSources.get(a.key), cb = geckoSources.get(b.key);
+    const aa = ca ? now - ca.at - a.minAge : Number.MAX_SAFE_INTEGER;
+    const ab = cb ? now - cb.at - b.minAge : Number.MAX_SAFE_INTEGER;
+    return ab - aa;
+  })[0];
+}
+
+async function refreshGeckoIncremental(force = false) {
+  if (geckoRefreshInFlight || Date.now() < geckoBlockedUntil) return;
+  const source = pickGeckoSource(force);
+  if (!source) return;
+  geckoRefreshInFlight = true;
+  try { await refreshGeckoEndpoint(source); rebuildGeckoCache(); }
+  catch (e) { state.warnings = [...state.warnings, e.message].slice(-10); }
+  finally { geckoRefreshInFlight = false; }
+}
+
+async function loadMarketPools(force = false) {
+  if (!geckoCache.pools.length) {
+    await refreshGeckoIncremental(true);
+    return geckoCache.pools;
+  }
+  void refreshGeckoIncremental(force);
+  return geckoCache.pools;
+}
+
+const n = (x, k) => Number(x?.[k] || 0);
+function poolAgeMs(createdAt) {
+  if (!createdAt) return null;
+  const ts = Date.parse(createdAt);
+  if (!Number.isFinite(ts)) return null;
+  const age = Date.now() - ts;
+  return age >= 0 ? age : 0;
+}
+
+function scorePool(p, previousHistory = []) {
+  const h1 = p.tx.h1, h24 = p.tx.h24, m5 = p.tx.m5;
+  const buys = n(h1, 'buys'), sells = n(h1, 'sells'), buyers = n(h1, 'buyers'), sellers = n(h1, 'sellers');
+  const total = buys + sells;
+  const pressure = total ? buys / total * 100 : 50;
+  const m15 = p.tx.m15 || {}, m30 = p.tx.m30 || {};
+  const m15Total = n(m15, 'buys') + n(m15, 'sells');
+  const m30Total = n(m30, 'buys') + n(m30, 'sells');
+  const m15Pressure = m15Total ? n(m15, 'buys') / m15Total * 100 : 50;
+  const m30Pressure = m30Total ? n(m30, 'buys') / m30Total * 100 : 50;
+  const participation = Math.min(100, Math.log10(Math.max(buyers + sellers, 1)) * 22);
+  const liquidityScore = Math.min(100, Math.log10(Math.max(p.liquidity, 1)) * 14);
+  const volumeLiquidity = Math.min(100, p.volume.h1 / Math.max(p.liquidity, 1) * 250);
+  const timeframeMomentum = Math.min(100, Math.max(0, 50 + p.changes.m15 * 0.7 + p.changes.m30 * 0.9 + (m15Pressure - 50) * 0.35 + (m30Pressure - 50) * 0.45));
+  const momentum = Math.max(0, Math.min(100, 35 + p.changes.m5 * 1.4 + p.changes.m15 * 0.35 + p.changes.m30 * 0.45 + p.changes.h1 * 0.5 + p.changes.h6 * 0.12 + volumeLiquidity * 0.20 + participation * 0.16 + timeframeMomentum * 0.10));
+  const balance = 100 - Math.min(100, Math.abs(buys - sells) / Math.max(total, 1) * 100);
+  const organic = Math.round(Math.min(100, buyers / Math.max(buys, 1) * 100) * 0.18 + Math.min(100, sellers / Math.max(sells, 1) * 100) * 0.12 + participation * 0.22 + liquidityScore * 0.20 + balance * 0.18 + Math.min(100, Math.log10(Math.max(n(h24, 'buys') + n(h24, 'sells'), 1)) * 15) * 0.10);
+  const acceleration = Math.max(0, Math.min(100, 45 + p.changes.m5 * 2.0 + p.changes.m15 * 0.7 + (n(m5, 'buys') + n(m5, 'sells')) * 2));
+  const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);
+
+  const ageMs = poolAgeMs(p.createdAt);
+  const ageHours = ageMs == null ? null : ageMs / (60 * 60 * 1000);
+  const metrics = {
+    marketCap: p.marketCap || p.fdv || 0, price: p.price, liquidity: p.liquidity,
+    buys, sells, buyers, sellers,
+    buyValue: p.volume.h1 * pressure / 100, sellValue: p.volume.h1 * (100 - pressure) / 100,
+    pressure: Math.round(pressure), organic, momentum: Math.round(momentum), score,
+    volume1h: p.volume.h1, volume24h: p.volume.h24,
+    change5m: p.changes.m5, change15m: p.changes.m15, change30m: p.changes.m30,
+    change1h: p.changes.h1, change6h: p.changes.h6, change24h: p.changes.h24,
+    volume: p.volume, tx: p.tx, changes: p.changes, timeframeData: p.timeframeData,
+    age: p.createdAt, ageMs, ageHours: ageHours == null ? null : Math.round(ageHours * 100) / 100,
+    history: previousHistory
+  };
+  metrics.stage = classifyStage(metrics, previousHistory);
+  return metrics;
+}
+
+function passesFilter(m) {
+  if (m.marketCap < 10000) return false;
+  if (m.liquidity < 2500) return false;
+  if (m.marketCap > 0 && m.marketCap < Math.max(2500, m.liquidity * 0.35)) return false;
+  if (m.buys + m.sells < 2) return false;
+  if (m.volume1h < 25) return false;
+  return true;
+}
+
+async function scan() {
+  const latestBlockPromise = latestBlockNumber();
+  const pools = await loadMarketPools();
+  const byToken = new Map();
+  for (const p of pools) {
+    const current = byToken.get(p.token);
+    if (!current || p.volume.h1 + p.liquidity > current.volume.h1 + current.liquidity) byToken.set(p.token, p);
+  }
+  const discovered = [...byToken.values()];
+  const results = [];
+  for (const p of discovered.slice(0, 120)) {
+    const key = p.token.toLowerCase();
+    const prev = history.get(key) || [];
+    const m = scorePool(p, prev);
+    if (!passesFilter(m)) continue;
+    const last = prev[prev.length - 1];
+    if (!last || Date.now() - last.ts >= 30000 || last.score !== m.score || last.stage !== m.stage) {
+      history.set(key, [...prev, { ts: Date.now(), score: m.score, stage: m.stage }].slice(-24));
+    }
+    const cachedSecurity = contractCache.get(key)?.data || {};
+    const cachedScout = scoutCache.get(key)?.data;
+    const holderFromCache = scoutInfo(cachedScout).holders;
+    const metrics = applyRisk({ ...m, history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });
+    results.push({ address: getAddress(p.token), name: p.name, symbol: p.symbol, image: p.image || '', ...metrics, verified: cachedSecurity.verified ?? null, contractExists: cachedSecurity.contractExists ?? null, proxy: cachedSecurity.proxy ?? null, holders: holderFromCache, pool: p.pool, dex: p.dex, history: history.get(key) || [] });
+  }
+  results.sort((a, b) => b.score - a.score);
+  const latestBlock = await latestBlockPromise;
+  const timeframeReady = discovered.length ? discovered.filter(p => p.timeframeData?.m15 && p.timeframeData?.m30).length / discovered.length * 100 : 0;
+  state = { ...state, status: 'LIVE', lastUpdate: new Date().toISOString(), scanCycle: state.scanCycle + 1, discovered: discovered.length, analyzed: results.length, active: results.filter(x => x.stage !== 'STABLE' && x.riskLevel !== 'FLAGGED').length, flagged: results.filter(x => x.riskLevel === 'FLAGGED').length, latestBlock, uptime: Math.floor((Date.now() - started) / 1000), errors: 0, timeframeCoverage: Math.round(timeframeReady) };
+  radar = results;
+  void enrichRadar(results);
+  console.log(`[scan] cycle=${state.scanCycle} pools=${pools.length} discovered=${discovered.length} candidates=${results.length} flagged=${state.flagged} tf15/30=${state.timeframeCoverage}% top=${results[0]?.symbol || 'none'}`);
+}
+
+async function safeScan() {
+  if (scanning) return;
+  scanning = true;
+  try { await scan(); }
+  catch (e) {
+    state = { ...state, status: 'DEGRADED', errors: state.errors + 1, warnings: [...state.warnings, e.message].slice(-10), uptime: Math.floor((Date.now() - started) / 1000) };
+    console.error(`[scan:error] ${e.message}`);
+  }
+  finally { scanning = false; }
+}
+
+const app = express();
+app.use(express.json());
+app.get('/health', (req, res) => res.json({ ok: true, chainId: 4663, status: state.status, latestBlock: state.latestBlock, uptime: state.uptime }));
+app.get('/api/status', (req, res) => res.json(state));
+app.get('/api/radar', (req, res) => res.json(radar));
+app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));
+app.get('/api/token/:address', async (req, res) => {
+  try {
+    const address = getAddress(req.params.address);
+    const meta = await tokenMeta(address);
+    const [scout, contract] = await Promise.all([blockscoutToken(address), blockscoutContract(address)]);
+    const info = scoutInfo(scout);
+    let holders = info.holders;
+    if (holders == null) {
+      const counters = await blockscoutCounters(address);
+      const n = Number(counters?.token_holders_count);
+      if (Number.isFinite(n)) holders = n;
+    }
+    const cachedRadar = radar.find(x => x.address.toLowerCase() === address.toLowerCase());
+    if (cachedRadar && cachedRadar.pool) return res.json({ ...meta, ...cachedRadar, holders: holders ?? cachedRadar.holders ?? null, verified: contract?.verified ?? cachedRadar.verified ?? null, contractExists: contract?.contractExists ?? cachedRadar.contractExists ?? null, proxy: contract?.proxy ?? cachedRadar.proxy ?? null, image: info.image || cachedRadar.image || '' });
+    let pools = null;
+    try { pools = await gecko(`/networks/robinhood/tokens/${address}/pools?include=base_token,quote_token,dex`); } catch { pools = null; }
+    const normalized = pools ? (pools?.data || []).map(x => normalizePool(x, includedTokenMap(pools))).filter(Boolean).slice(0, 10) : [];
+    if (!normalized.length) return res.json({ ...meta, marketCap: Number(scout?.market_cap || scout?.circulating_market_cap || 0), holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image, score: 0, organic: 0, momentum: 0, stage: 'STABLE', risk: 100, riskLevel: 'REVIEW', riskFlags: ['No active market pool found'], history: history.get(address.toLowerCase()) || [] });
+    const best = normalized.sort((a, b) => b.volume.h1 + b.liquidity - (a.volume.h1 + a.liquidity))[0];
+    const key = address.toLowerCase();
+    const metrics = applyRisk({ ...scorePool(best, history.get(key) || []), history: history.get(key) || [] }, { holders, ...contract });
+    history.set(key, [...(history.get(key) || []), { ts: Date.now(), score: metrics.score, stage: metrics.stage }].slice(-24));
+    res.json({ ...meta, ...metrics, holders, verified: contract?.verified ?? null, contractExists: contract?.contractExists ?? null, proxy: contract?.proxy ?? null, image: info.image || best.image || '', pool: best.pool, dex: best.dex, history: history.get(key) });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+app.get('/api/rpc', (req, res) => res.json({ chainId: 4663, rpcCount: RPC_URLS.length, rpcs: RPC_URLS.map((url, i) => ({ index: i + 1, url, role: i === 0 ? 'primary' : 'fallback' })), multicall3: MULTICALL3, blockscout: BLOCKSCOUT, marketData: 'GeckoTerminal' }));
+app.use(express.static(path.join(ROOT, 'dist')));
+app.get(/.*/, (req, res) => res.sendFile(path.join(ROOT, 'dist', 'index.html')));
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`RunnerHunter listening on 0.0.0.0:${PORT}`);
+  safeScan();
+  setInterval(safeScan, 30000);
+});
