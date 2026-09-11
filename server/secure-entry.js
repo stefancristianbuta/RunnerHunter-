@@ -46,12 +46,12 @@ registerHooks({
 
       source = source.replace(
         "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));",
-        "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));\napp.get('/api/telemetry', (req, res) => res.json(telemetrySnapshot(req.query.token || '')));"
+        "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));\napp.get('/api/telemetry', (req, res) => res.json(telemetrySnapshot(req.query.token || ''))"
       );
 
       source = source.replace(
         "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }\n];",
-        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 }\n];"
+        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 },\n  { key: 'uniswap-v3-fast', path: '/networks/robinhood/dexes/uniswap-v3-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'uniswap-v4-fast', path: '/networks/robinhood/dexes/uniswap-v4-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'ramses-v3-fast', path: '/networks/robinhood/dexes/ramses-v3-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 180000 }\n];"
       );
 
       source = source.replace(
@@ -101,5 +101,5 @@ async function getSimWhale(token) {
   }
 });
 
-console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry + dedicated Pons discovery');
+console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry + dedicated Pons discovery + top DEX direct discovery');
 await import('./index.js');
