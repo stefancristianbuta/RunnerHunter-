@@ -15,8 +15,49 @@ registerHooks({
     let source = sourceText;
     if (url === TARGET) {
       source = source.replace("import { applyRisk, classifyStage } from './risk.js';", "import { applyRisk, classifyStage, explainStage } from './risk.js';\nimport { recordTelemetry, telemetrySnapshot, getTelemetryForToken } from './telemetry.js'");
-      source = source.replace('    const m = scorePool(p, prev);\n    if (!passesFilter(m)) continue;', `    const m = scorePool(p, prev);\n    const stageInfo = explainStage(m, prev);\n    const previousStage = prev[prev.length - 1]?.stage || null;\n    const filterReasons = [];\n    if (m.marketCap < 10000) filterReasons.push('MARKET_CAP_LT_10000');\n    if (m.liquidity < 2500) filterReasons.push('LIQUIDITY_LT_2500');\n    if (m.marketCap > 0 && m.marketCap < Math.max(2500, m.liquidity * 0.35)) filterReasons.push('MC_LT_35PCT_LIQUIDITY');\n    if (m.buys + m.sells < 2) filterReasons.push('TRADES_LT_2');\n    if (m.volume1h < 25) filterReasons.push('VOLUME1H_LT_25');\n    if (filterReasons.length) {\n      recordTelemetry({ cycle: state.scanCycle + 1, outcome: 'MARKET_REJECT', token: p.token, address: getAddress(p.token), symbol: p.symbol, name: p.name, score: m.score, stage: stageInfo.stage, previousStage, stageReason: stageInfo.reason, stageSignals: stageInfo.signals, filterReasons, marketCap: m.marketCap, liquidity: m.liquidity, volume1h: m.volume1h, pressure: m.pressure, buys: m.buys, sells: m.sells, ageMs: m.ageMs, change5m: m.change5m, change15m: m.change15m, change30m: m.change30m, change1h: m.change1h, change6h: m.change6h });\n      continue;\n    }`);
-      source = source.replace('    const metrics = applyRisk({ ...m, history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });', `    const metrics = applyRisk({ ...m, address: getAddress(p.token), history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });\n    recordTelemetry({ cycle: state.scanCycle + 1, outcome: metrics.riskLevel === 'FLAGGED' ? 'RISK_REJECT' : 'CANDIDATE', token: p.token, address: getAddress(p.token), symbol: p.symbol, name: p.name, score: metrics.score, stage: metrics.stage, previousStage, stageReason: metrics.stageReason, stageSignals: metrics.stageSignals, risk: metrics.risk, riskLevel: metrics.riskLevel, riskFlags: metrics.riskFlags, marketCap: metrics.marketCap, liquidity: metrics.liquidity, volume1h: metrics.volume1h, pressure: metrics.pressure, buys: metrics.buys, sells: metrics.sells, ageMs: metrics.ageMs, change5m: metrics.change5m, change15m: metrics.change15m, change30m: metrics.change30m, change1h: metrics.change1h, change6h: metrics.change6h, transition: previousStage !== metrics.stage });\n    metrics.telemetry = getTelemetryForToken(getAddress(p.token));`);
+
+      const aggregateHelper = `
+function aggregateTokenPools(pools) {
+  const groups = new Map();
+  for (const p of pools) {
+    if (!p?.token) continue;
+    const key = p.token.toLowerCase();
+    const current = groups.get(key);
+    if (!current) {
+      groups.set(key, { ...p, poolCount: 1, dexCount: 1, _dexes: new Set([p.dex]), _pools: [p] });
+      continue;
+    }
+    current.poolCount++;
+    current._pools.push(p);
+    current._dexes.add(p.dex);
+    current.dexCount = current._dexes.size;
+    current.liquidity += Number(p.liquidity || 0);
+    for (const keyTf of ['m5','m15','m30','h1','h6','h24']) {
+      current.volume[keyTf] = Number(current.volume[keyTf] || 0) + Number(p.volume?.[keyTf] || 0);
+      for (const field of ['buys','sells','buyers','sellers']) current.tx[keyTf][field] = Number(current.tx[keyTf]?.[field] || 0) + Number(p.tx?.[keyTf]?.[field] || 0);
+    }
+    const weightA = Math.max(Number(current.liquidity || 0) - Number(p.liquidity || 0), 1);
+    const weightB = Math.max(Number(p.liquidity || 0), 1);
+    for (const keyTf of ['m5','m15','m30','h1','h6','h24']) current.changes[keyTf] = (Number(current.changes[keyTf] || 0) * weightA + Number(p.changes?.[keyTf] || 0) * weightB) / (weightA + weightB);
+    if ((Number(p.liquidity || 0) + Number(p.volume?.h1 || 0)) > (Number(current.liquidity || 0) + Number(current.volume?.h1 || 0))) {
+      current.pool = p.pool; current.dex = p.dex; current.name = p.name; current.symbol = p.symbol; current.image = p.image || current.image; current.price = p.price;
+    }
+    current.marketCap = Math.max(Number(current.marketCap || 0), Number(p.marketCap || 0), Number(p.fdv || 0));
+    current.fdv = Math.max(Number(current.fdv || 0), Number(p.fdv || 0));
+    current.createdAt = [current.createdAt, p.createdAt].filter(Boolean).sort()[0] || null;
+    current.timeframeData = Object.fromEntries(['m5','m15','m30','h1','h6','h24'].map(k => [k, Boolean(current.timeframeData?.[k] || p.timeframeData?.[k])]));
+  }
+  for (const item of groups.values()) { delete item._dexes; delete item._pools; }
+  return [...groups.values()];
+}
+`;
+      source = source.replace('\nasync function scan() {', `${aggregateHelper}\nasync function scan() {`);
+      source = source.replace(`    const byToken = new Map();\n  for (const p of pools) {\n    const current = byToken.get(p.token);\n    if (!current || p.volume.h1 + p.liquidity > current.volume.h1 + current.liquidity) byToken.set(p.token, p);\n  }\n  const discovered = [...byToken.values()];`, `    const discovered = aggregateTokenPools(pools);`);
+      source = source.replace('  const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);', "  const dexBonus = Math.min(10, Math.max(0, Number(p.dexCount || 1) - 1) * 5);\n  const score = Math.round(Math.min(100, momentum * 0.42 + organic * 0.33 + acceleration * 0.25 + dexBonus));");
+      source = source.replace('    volume1h: p.volume.h1, volume24h: p.volume.h24,', '    volume1h: p.volume.h1, volume24h: p.volume.h24,\n    dexCount: Number(p.dexCount || 1), poolCount: Number(p.poolCount || 1), dexExpansionScore: dexBonus,');
+      source = source.replace('    const m = scorePool(p, prev);', '    const m = scorePool(p, prev);\n    m.acceleration = Math.round(45 + m.change5m * 2 + m.change15m * 0.7 + (Number(m.tx?.m5?.buys || 0) + Number(m.tx?.m5?.sells || 0)) * 2 + Number(m.dexExpansionScore || 0));');
+      source = source.replace('    const stageInfo = explainStage(m, prev);', '    const stageInfo = explainStage(m, prev);');
+      source = source.replace('    const metrics = applyRisk({ ...m, address: getAddress(p.token), history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });', '    const metrics = applyRisk({ ...m, address: getAddress(p.token), history: history.get(key) || [] }, { holders: holderFromCache, ...cachedSecurity });');
       source = source.replace("app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));", "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));\napp.get('/api/telemetry', (req, res) => res.json(telemetrySnapshot(req.query.token || '')))");
       source = source.replace("  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }\n];", "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 },\n  { key: 'uniswap-v3-fast', path: '/networks/robinhood/dexes/uniswap-v3-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'uniswap-v4-fast', path: '/networks/robinhood/dexes/uniswap-v4-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'ramses-v3-fast', path: '/networks/robinhood/dexes/ramses-v3-robinhood/pools?page=1&include=base_token,quote_token,dex', minAge: 180000 }\n];");
       source = source.replace('geckoNextAllowedAt = Date.now() + 6500;', 'geckoNextAllowedAt = Date.now() + 10000;');
@@ -33,5 +74,5 @@ registerHooks({
   }
 });
 
-console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry + dedicated Pons discovery + top DEX direct discovery');
+console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry + early signal + multi-pool aggregation + dedicated Pons discovery + top DEX direct discovery');
 await import('./index.js');
