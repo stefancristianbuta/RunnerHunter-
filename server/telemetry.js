@@ -21,6 +21,7 @@ const summary = {
 
 const inc = (map, key) => { map[key] = (map[key] || 0) + 1; };
 const num = value => Number(value || 0);
+const pct = (a, b) => b > 0 ? (a - b) / b * 100 : null;
 
 function compactSignals(signals) {
   if (!signals) return null;
@@ -63,14 +64,33 @@ function survivalQuality(sample, baseline) {
   return num(sample.marketCap) >= floorMc && num(sample.liquidity) >= 5000 && num(sample.buys) > 0 && num(sample.sells) > 0 && num(sample.volume1h) >= 100 && num(sample.pressure) >= 52 && num(sample.change5m) > -20 && num(sample.change15m) > -15 && num(sample.change30m) > -15 && num(sample.risk) < 20 && String(sample.riskLevel) === 'CLEAR';
 }
 
+function outcomeFor(track, windowMs) {
+  const baseline = track.samples[0];
+  if (!baseline) return null;
+  const target = track.samples.filter(x => x.ts >= baseline.ts + windowMs - 90000 && x.ts <= baseline.ts + windowMs + 90000).at(-1) || track.samples.at(-1);
+  if (!target || target.ts < baseline.ts + windowMs - 90000) return null;
+  const baselineMc = num(baseline.marketCap);
+  const targetMc = num(target.marketCap);
+  const returnPct = pct(targetMc, baselineMc);
+  const peakMc = Math.max(...track.samples.filter(x => x.ts <= target.ts).map(x => num(x.marketCap)), baselineMc);
+  const drawdownPct = peakMc > 0 ? (targetMc - peakMc) / peakMc * 100 : null;
+  const survived = survivalQuality(target, baseline);
+  const winner = survived && returnPct != null && returnPct >= 10;
+  const strongWinner = survived && returnPct != null && returnPct >= 25;
+  return { winner, strongWinner, survived, returnPct, drawdownPct, targetStage: target.stage, score: num(baseline.score), acceleration: baseline.accelerationScore ?? null, stage: baseline.stage };
+}
+
 function evaluateSurvival(track, now) {
   const baseline = track.samples[0];
   if (!baseline) return;
   for (const [label, windowMs] of [['15m', 15 * 60000], ['30m', 30 * 60000], ['60m', 60 * 60000]]) {
     if (track.reported[label] || now - baseline.ts < windowMs) continue;
     const target = track.samples.filter(x => x.ts >= baseline.ts + windowMs - 90000 && x.ts <= baseline.ts + windowMs + 90000).at(-1) || track.samples.at(-1);
+    if (!target || target.ts < baseline.ts + windowMs - 90000) continue;
     const ok = survivalQuality(target, baseline);
+    const outcome = outcomeFor(track, windowMs);
     track.reported[label] = ok ? 'PASS' : 'FAIL';
+    track.outcomes[label] = outcome;
     if (ok) summary[label === '15m' ? 'survived15m' : label === '30m' ? 'survived30m' : 'survived60m']++;
     else summary.failed++;
   }
@@ -82,7 +102,7 @@ function trackSample(input, stageInfo) {
   const now = Date.now();
   let track = tracks.get(address);
   if (!track) {
-    track = { address, symbol: input.symbol || '?', firstSeen: now, samples: [], reported: {}, acceleration: null, lastRecorded: 0 };
+    track = { address, symbol: input.symbol || '?', firstSeen: now, samples: [], reported: {}, outcomes: {}, acceleration: null, lastRecorded: 0 };
     tracks.set(address, track);
     summary.detected++;
   }
@@ -95,6 +115,7 @@ function trackSample(input, stageInfo) {
   };
   const previous = track.samples.at(-1);
   track.acceleration = accelerationFor(previous, current);
+  current.accelerationScore = track.acceleration.score;
   track.samples.push(current);
   if (track.samples.length > MAX_TRACK_SAMPLES) track.samples.shift();
   track.lastRecorded = now;
@@ -137,21 +158,59 @@ export function recordTelemetry(input) {
   return track;
 }
 
+function bucketScore(score) {
+  const n = Number(score || 0);
+  if (n < 50) return '<50';
+  if (n < 60) return '50-59';
+  if (n < 70) return '60-69';
+  if (n < 80) return '70-79';
+  if (n < 90) return '80-89';
+  return '90-100';
+}
+
+function aggregateOutcomes(windowLabel) {
+  const rows = [];
+  for (const track of tracks.values()) {
+    const outcome = track.outcomes?.[windowLabel];
+    const baseline = track.samples[0];
+    if (!outcome || !baseline) continue;
+    rows.push({ ...outcome, stage: baseline.stage, scoreBucket: bucketScore(baseline.score), dexCount: num(baseline.dexCount), ageMinutes: (baseline.ageMs || 0) / 60000 });
+  }
+  const group = (keyFn) => {
+    const map = new Map();
+    for (const row of rows) {
+      const key = keyFn(row);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(row);
+    }
+    return Object.fromEntries([...map.entries()].map(([key, list]) => [key, {
+      samples: list.length,
+      winRatePct: Math.round(list.filter(x => x.winner).length / list.length * 1000) / 10,
+      strongWinRatePct: Math.round(list.filter(x => x.strongWinner).length / list.length * 1000) / 10,
+      survivalRatePct: Math.round(list.filter(x => x.survived).length / list.length * 1000) / 10,
+      avgReturnPct: Math.round(list.reduce((s, x) => s + num(x.returnPct), 0) / list.length * 10) / 10,
+      avgDrawdownPct: Math.round(list.reduce((s, x) => s + num(x.drawdownPct), 0) / list.length * 10) / 10
+    }]));
+  };
+  return { samples: rows.length, byStage: group(x => x.stage), byScore: group(x => x.scoreBucket) };
+}
+
 export function getTelemetryForToken(address) {
   const track = tracks.get(String(address || '').toLowerCase());
   if (!track) return null;
   const latest = track.samples.at(-1) || null;
-  return { firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, latest };
+  return { firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest };
 }
 
 export function telemetrySnapshot(token = '') {
   const needle = String(token || '').trim().toLowerCase();
   const filtered = needle ? entries.filter(x => String(x.token || '').toLowerCase() === needle || String(x.address || '').toLowerCase() === needle || String(x.symbol || '').toLowerCase() === needle) : entries;
-  const tracked = [...tracks.values()].map(track => ({ address: track.address, symbol: track.symbol, firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, latest: track.samples.at(-1) || null })).sort((a, b) => (b.acceleration?.score || 0) - (a.acceleration?.score || 0));
+  const tracked = [...tracks.values()].map(track => ({ address: track.address, symbol: track.symbol, firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest: track.samples.at(-1) || null })).sort((a, b) => (b.acceleration?.score || 0) - (a.acceleration?.score || 0));
   return {
     at: new Date().toISOString(), buffer: filtered.length, maxBuffer: MAX_ENTRIES, trackedTokens: tracks.size,
     summary: { ...summary, stageCounts: { ...summary.stageCounts }, rejectionReasons: { ...summary.rejectionReasons }, conditionFailures: Object.fromEntries(Object.entries(summary.conditionFailures).map(([k, v]) => [k, { ...v }])) },
     acceleration: { accelerating: tracked.filter(x => x.acceleration?.label === 'ACCELERATING').length, weakening: tracked.filter(x => x.acceleration?.label === 'WEAKENING').length, steady: tracked.filter(x => x.acceleration?.label === 'STEADY').length },
+    outcomes: { '15m': aggregateOutcomes('15m'), '30m': aggregateOutcomes('30m'), '60m': aggregateOutcomes('60m') },
     topAccelerating: tracked.filter(x => x.acceleration?.label === 'ACCELERATING').slice(0, 20), tracked: tracked.slice(0, 100), decisions: filtered.slice(-500).reverse()
   };
 }
