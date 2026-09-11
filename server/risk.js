@@ -2,7 +2,6 @@ import { queueSecurity, securitySnapshot } from './security.js';
 
 const clamp = (n, min = 0, max = 100) => Math.max(min, Math.min(max, Number(n) || 0));
 const EARLY_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-
 const n = (x, k) => Number(x?.[k] || 0);
 
 function tfStats(metrics, key) {
@@ -30,6 +29,7 @@ export function stageSignals(metrics, previousHistory = []) {
   const pressure = Number(metrics?.pressure || 50);
   const totalTrades = Number(metrics?.buys || 0) + Number(metrics?.sells || 0);
   const ageMs = Number(metrics?.ageMs);
+  const acceleration = Number(metrics?.acceleration || 50);
 
   const m5tf = tfStats(metrics, 'm5');
   const m15 = tfStats(metrics, 'm15');
@@ -43,6 +43,15 @@ export function stageSignals(metrics, previousHistory = []) {
   const m30Strong = m30.change >= 1.5 || (m30Active && m30.pressure >= 58);
   const m15Weak = m15.change <= -1 || (m15Active && m15.pressure <= 45);
   const m30Weak = m30.change <= -1.5 || (m30Active && m30.pressure <= 45);
+
+  const watch = {
+    ageValid: Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS,
+    liquidity: Number(metrics?.liquidity || 0) >= 5000,
+    volume: volume1h >= 50,
+    trades: totalTrades >= 2,
+    firstSignal: m5 > 1.5 || m5tf.total >= 2 || acceleration >= 65,
+    pressure: pressure >= 50
+  };
 
   const early = {
     ageValid: Number.isFinite(ageMs) && ageMs <= EARLY_MAX_AGE_MS,
@@ -64,12 +73,8 @@ export function stageSignals(metrics, previousHistory = []) {
   };
 
   const healthyM5Pullback =
-    m5 >= -20 &&
-    h1 >= 10 &&
-    m15.change >= 3 &&
-    m30.change >= 1 &&
-    pressure >= 50 &&
-    totalTrades >= 20 &&
+    m5 >= -20 && h1 >= 10 && m15.change >= 3 && m30.change >= 1 &&
+    pressure >= 50 && totalTrades >= 20 &&
     ((m15Active && m15Bullish) || (m30Active && m30Bullish));
 
   growing.m5NonNegative = m5 >= 0 || healthyM5Pullback;
@@ -104,11 +109,12 @@ export function stageSignals(metrics, previousHistory = []) {
       ageMs: Number.isFinite(ageMs) ? ageMs : null,
       ageHours: Number.isFinite(ageMs) ? Math.round(ageMs / 3600000 * 100) / 100 : null,
       h1, h6, m5, m15: m15.change, m30: m30.change,
-      volume1h, pressure, totalTrades,
+      volume1h, pressure, totalTrades, acceleration,
       m5Trades: m5tf.total, m15Trades: m15.total, m30Trades: m30.total,
       m15Pressure: Math.round(m15.pressure * 10) / 10,
       m30Pressure: Math.round(m30.pressure * 10) / 10
     },
+    watch: { ...watch, pass: Object.values(watch).every(Boolean) },
     early: { ...early, pass: Object.values(early).every(Boolean) },
     growing,
     running,
@@ -123,6 +129,7 @@ export function explainStage(metrics, previousHistory = []) {
   if (s.pullback.pass) return { stage: 'PULLBACK', reason: 'Prior active run plus pullback pattern', signals: s };
   if (s.growing.pass) return { stage: 'GROWING', reason: s.growing.pullbackRecovery ? 'Higher-timeframe momentum confirmed despite a healthy M5 pullback' : 'Momentum, volume, pressure and timeframe confirmation passed', signals: s };
   if (s.early.pass) return { stage: 'EARLY', reason: 'Fresh enough with initial momentum, volume, pressure, trades and timeframe activity', signals: s };
+  if (s.watch.pass) return { stage: 'WATCH', reason: 'Early acceleration signal detected before full EARLY confirmation', signals: s };
   return { stage: 'STABLE', reason: 'No active stage threshold fully passed', signals: s };
 }
 
@@ -161,8 +168,9 @@ export function assessRisk(metrics, security = {}) {
   else if (h1 >= 35 && totalTrades < 15) add(16, 'Fast price acceleration with low activity');
   if (m5 >= 20 && totalTrades < 20) add(10, 'Short-term acceleration');
 
-  if (buys >= 8 && sells <= 3) add(16, 'Insufficient sell-side confirmation');
-  else if (buys >= 5 && sells === 0) add(22, 'No observed sells');
+  if (sells === 0 && totalTrades >= 16) add(22, 'No observed sells after meaningful activity');
+  else if (sells === 0 && totalTrades >= 6) add(12, 'No observed sells yet');
+  else if (buys >= 8 && sells <= 3 && totalTrades >= 12) add(8, 'Limited sell-side confirmation');
   if (pressure >= 85 && totalTrades < 25) add(10, 'Buy pressure concentrated in few trades');
 
   if (security?.contractExists === false) add(40, 'Contract bytecode not confirmed');
@@ -170,7 +178,7 @@ export function assessRisk(metrics, security = {}) {
   if (security?.proxy === true) add(6, 'Upgradeable/proxy contract');
 
   const onChain = securitySnapshot(address);
-  if (address && Number(metrics?.score || 0) >= 70) queueSecurity(address);
+  if (address && Number(metrics?.score || 0) >= 60) queueSecurity(address);
   if (onChain?.securityLevel === 'FLAGGED') {
     risk = Math.max(risk, 70);
     for (const flag of onChain.securityFlags || []) flags.push(flag);
