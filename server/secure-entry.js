@@ -52,7 +52,7 @@ function aggregateTokenPools(pools) {
 }
 `;
       source = source.replace('\nasync function scan() {', `${aggregateHelper}\nasync function scan() {`);
-      source = source.replace(`    const byToken = new Map();\n  for (const p of pools) {\n    const current = byToken.get(p.token);\n    if (!current || p.volume.h1 + p.liquidity > current.volume.h1 + current.liquidity) byToken.set(p.token, p);\n  }\n  const discovered = [...byToken.values()];`, `    const discovered = aggregateTokenPools(pools);`);
+      source = source.replace(`  const byToken = new Map();\n  for (const p of pools) {\n    const current = byToken.get(p.token);\n    if (!current || p.volume.h1 + p.liquidity > current.volume.h1 + current.liquidity) byToken.set(p.token, p);\n  }\n  const discovered = [...byToken.values()];`, `  const discovered = aggregateTokenPools(pools);`);
       source = source.replace('  const score = Math.round(momentum * 0.42 + organic * 0.33 + acceleration * 0.25);', "  const dexBonus = Math.min(10, Math.max(0, Number(p.dexCount || 1) - 1) * 5);\n  const score = Math.round(Math.min(100, momentum * 0.42 + organic * 0.33 + acceleration * 0.25 + dexBonus));");
       source = source.replace('    volume1h: p.volume.h1, volume24h: p.volume.h24,', '    volume1h: p.volume.h1, volume24h: p.volume.h24,\n    dexCount: Number(p.dexCount || 1), poolCount: Number(p.poolCount || 1), dexExpansionScore: dexBonus,');
       source = source.replace('    const m = scorePool(p, prev);', '    const m = scorePool(p, prev);\n    m.acceleration = Math.round(45 + m.change5m * 2 + m.change15m * 0.7 + (Number(m.tx?.m5?.buys || 0) + Number(m.tx?.m5?.sells || 0)) * 2 + Number(m.dexExpansionScore || 0));');
