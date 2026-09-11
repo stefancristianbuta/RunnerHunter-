@@ -9,6 +9,7 @@ const nativeGetBlockNumber = JsonRpcProvider.prototype.getBlockNumber;
 const nativeFetch = globalThis.fetch.bind(globalThis);
 const holderCache = new Map();
 const HOLDER_CACHE_MS = 10 * 60 * 1000;
+const FALLBACK_LOGO_BASE = 'https://dd.dexscreener.com/ds-data/tokens/robinhood';
 
 JsonRpcProvider.prototype.getBlockNumber = function (...args) {
   return Promise.race([
@@ -77,6 +78,25 @@ function jsonResponse(data) {
   });
 }
 
+function fallbackLogo(address) {
+  const value = String(address || '').toLowerCase();
+  return /^0x[a-f0-9]{40}$/.test(value) ? `${FALLBACK_LOGO_BASE}/${value}.png` : '';
+}
+
+async function blockscoutTokenResponse(input, address) {
+  try {
+    const response = await nativeFetch(input, {
+      signal: AbortSignal.timeout(4500),
+      headers: { accept: 'application/json' }
+    });
+    if (!response.ok) return null;
+    const data = await response.json();
+    return data && typeof data === 'object' ? data : null;
+  } catch {
+    return null;
+  }
+}
+
 const wrappedFetch = async (input, init) => {
   const url = typeof input === 'string' ? input : input?.url || '';
   const tokenMatch = url.match(/https?:\/\/[^/]+\/api\/v2\/tokens\/(0x[a-fA-F0-9]{40})(?:\/(counters))?$/);
@@ -84,7 +104,30 @@ const wrappedFetch = async (input, init) => {
     const address = tokenMatch[1];
     const count = await holderFallback(address);
     if (tokenMatch[2] === 'counters') return jsonResponse({ token_holders_count: count });
-    return jsonResponse({ holders_count: count, holder_count: count, token_holders_count: count, icon_url: '' });
+    const scout = await blockscoutTokenResponse(input, address);
+    return jsonResponse({
+      ...(scout || {}),
+      holders_count: count ?? scout?.holders_count ?? scout?.holder_count ?? scout?.token_holders_count ?? null,
+      holder_count: count ?? scout?.holder_count ?? scout?.holders_count ?? scout?.token_holders_count ?? null,
+      token_holders_count: count ?? scout?.token_holders_count ?? scout?.holders_count ?? scout?.holder_count ?? null,
+      icon_url: scout?.icon_url || scout?.image_url || scout?.metadata?.logo || scout?.metadata?.image || ''
+    });
+  }
+  if (/https?:\/\/[^/]+\/api\/radar(?:\?.*)?$/.test(url)) {
+    const response = await nativeFetch(input, init);
+    if (!response.ok) return response;
+    try {
+      const data = await response.json();
+      if (!Array.isArray(data)) return jsonResponse(data);
+      const enriched = data.map(item => {
+        if (!item || typeof item !== 'object') return item;
+        const image = String(item.image || '').trim();
+        return image ? item : { ...item, image: fallbackLogo(item.address) };
+      });
+      return jsonResponse(enriched);
+    } catch {
+      return response;
+    }
   }
   return nativeFetch(input, init);
 };
