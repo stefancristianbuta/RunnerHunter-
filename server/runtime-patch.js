@@ -14,7 +14,7 @@ const FALLBACK_LOGO_BASE = 'https://dd.dexscreener.com/ds-data/tokens/robinhood'
 JsonRpcProvider.prototype.getBlockNumber = function (...args) {
   return Promise.race([
     nativeGetBlockNumber.apply(this, args),
-    new Promise((_, reject) => setTimeout(() => reject(new Error('RPC getBlockNumber timeout')), 3000))
+    new Promise((_, reject) => setTimeout(() => reject(new Error('RPC getBlockNumber timeout')), 5000))
   ]);
 };
 
