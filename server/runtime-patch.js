@@ -109,7 +109,6 @@ express.application.listen = function (...args) {
 };
 
 async function pollXPublisher() {
-  if (!process.env.X_ACCESS_TOKEN) return;
   try {
     const port = Number(process.env.PORT || 8080);
     const response = await nativeFetch(`http://127.0.0.1:${port}/api/radar`, {
@@ -146,11 +145,15 @@ async function pollXPublisher() {
         change30m: item.change30m,
         change1h: item.change1h,
         change6h: item.change6h,
+        dexCount: item.dexCount,
+        poolCount: item.poolCount,
         stageSignals: item.stageSignals,
         transition: item.history?.at(-2)?.stage !== item.stage
       });
-      const result = await publishEligibleRunner(item);
-      if (result.posted) break;
+      if (process.env.X_ACCESS_TOKEN) {
+        const result = await publishEligibleRunner(item);
+        if (result.posted) break;
+      }
     }
   } catch (error) {
     console.error(`[x-publisher:error] ${error.message}`);
