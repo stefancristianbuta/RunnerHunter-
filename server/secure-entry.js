@@ -51,7 +51,7 @@ registerHooks({
 
       source = source.replace(
         "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }\n];",
-        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 }\n];"
+        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/dexes/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 }\n];"
       );
 
       source = source.replace(
