@@ -90,6 +90,7 @@ function evaluateSurvival(track, now) {
     track.reported[label] = ok ? 'PASS' : 'FAIL';
     if (ok) summary[label === '15m' ? 'survived15m' : label === '30m' ? 'survived30m' : 'survived60m']++;
     else summary.failed++;
+    console.log(`[telemetry] PROOF token=${track.symbol || '?'} window=${label} result=${ok ? 'PASS' : 'FAIL'} stage=${baseline.stage || 'STABLE'} score=${baseline.score ?? 0}`);
   }
 }
 
