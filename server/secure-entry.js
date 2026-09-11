@@ -17,7 +17,7 @@ registerHooks({
     if (url === TARGET) {
       source = source.replace(
         "import { applyRisk, classifyStage } from './risk.js';",
-        "import { applyRisk, classifyStage, explainStage } from './risk.js';\nimport { recordTelemetry, telemetrySnapshot, getTelemetryForToken } from './telemetry.js';"
+        "import { applyRisk, classifyStage, explainStage } from './risk.js';\nimport { recordTelemetry, telemetrySnapshot, getTelemetryForToken } from './telemetry.js'"
       );
 
       source = source.replace(
@@ -47,6 +47,21 @@ registerHooks({
       source = source.replace(
         "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));",
         "app.get('/api/market-debug', (req, res) => res.json({ status: state.status, pools: geckoCache.pools.length, radar: radar.length, timeframeCoverage: state.timeframeCoverage, geckoCooldown: Math.max(0, geckoBlockedUntil - Date.now()), geckoRefreshInFlight, sources: Object.fromEntries(GECKO_ENDPOINTS.map(x => [x.key, { at: geckoSources.get(x.key)?.at || 0, pools: geckoSources.get(x.key)?.pools?.length || 0, age: geckoSources.has(x.key) ? Date.now() - geckoSources.get(x.key).at : null }])), warnings: state.warnings, sample: geckoCache.pools.slice(0, 10) }));\napp.get('/api/telemetry', (req, res) => res.json(telemetrySnapshot(req.query.token || '')));"
+      );
+
+      source = source.replace(
+        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 }\n];",
+        "  { key: 'pools-2', path: '/networks/robinhood/pools?page=2&include=base_token,quote_token,dex', minAge: 180000 },\n  { key: 'pons-1', path: '/networks/robinhood/pons-v2-dex/pools?page=1&include=base_token,quote_token,dex', minAge: 120000 },\n  { key: 'pons-2', path: '/networks/robinhood/pons-v2-dex/pools?page=2&include=base_token,quote_token,dex', minAge: 240000 },\n  { key: 'pons-3', path: '/networks/robinhood/pons-v2-dex/pools?page=3&include=base_token,quote_token,dex', minAge: 360000 }\n];"
+      );
+
+      source = source.replace(
+        'geckoNextAllowedAt = Date.now() + 6500;',
+        'geckoNextAllowedAt = Date.now() + 10000;'
+      );
+
+      source = source.replace(
+        'geckoBlockedUntil = Date.now() + Math.max(60, retry) * 1000;\n      throw new Error(`GeckoTerminal 429; cooldown ${Math.max(60, retry)}s`);',
+        'geckoBlockedUntil = Date.now() + Math.max(120, retry) * 1000;\n      throw new Error(`GeckoTerminal 429; cooldown ${Math.max(120, retry)}s`);'
       );
     }
 
@@ -86,5 +101,5 @@ async function getSimWhale(token) {
   }
 });
 
-console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry');
+console.log('[secure-entry] security source hook active: funded-holder honeypot simulation + contract permissions + live runner telemetry + dedicated Pons discovery');
 await import('./index.js');
