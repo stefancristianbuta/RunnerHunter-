@@ -22,6 +22,7 @@ const summary = {
 const inc = (map, key) => { map[key] = (map[key] || 0) + 1; };
 const num = value => Number(value || 0);
 const pct = (a, b) => b > 0 ? (a - b) / b * 100 : null;
+const SIGNAL_STAGES = new Set(['WATCH', 'EARLY', 'GROWING', 'RUNNING', 'PULLBACK']);
 
 function compactSignals(signals) {
   if (!signals) return null;
@@ -64,8 +65,13 @@ function survivalQuality(sample, baseline) {
   return num(sample.marketCap) >= floorMc && num(sample.liquidity) >= 5000 && num(sample.buys) > 0 && num(sample.sells) > 0 && num(sample.volume1h) >= 100 && num(sample.pressure) >= 52 && num(sample.change5m) > -20 && num(sample.change15m) > -15 && num(sample.change30m) > -15 && num(sample.risk) < 20 && String(sample.riskLevel) === 'CLEAR';
 }
 
+function signalBaselineFor(track) {
+  if (track.signalBaselineTs) return track.samples.find(x => x.ts === track.signalBaselineTs) || null;
+  return track.samples.find(x => SIGNAL_STAGES.has(x.stage)) || null;
+}
+
 function outcomeFor(track, windowMs) {
-  const baseline = track.samples[0];
+  const baseline = signalBaselineFor(track);
   if (!baseline) return null;
   const target = track.samples.filter(x => x.ts >= baseline.ts + windowMs - 90000 && x.ts <= baseline.ts + windowMs + 90000).at(-1) || track.samples.at(-1);
   if (!target || target.ts < baseline.ts + windowMs - 90000) return null;
@@ -77,11 +83,11 @@ function outcomeFor(track, windowMs) {
   const survived = survivalQuality(target, baseline);
   const winner = survived && returnPct != null && returnPct >= 10;
   const strongWinner = survived && returnPct != null && returnPct >= 25;
-  return { winner, strongWinner, survived, returnPct, drawdownPct, targetStage: target.stage, score: num(baseline.score), acceleration: baseline.accelerationScore ?? null, stage: baseline.stage };
+  return { winner, strongWinner, survived, returnPct, drawdownPct, targetStage: target.stage, score: num(baseline.score), acceleration: baseline.accelerationScore ?? null, stage: baseline.stage, dexCount: num(baseline.dexCount), poolCount: num(baseline.poolCount), ageMinutes: num(baseline.ageMs) / 60000 };
 }
 
 function evaluateSurvival(track, now) {
-  const baseline = track.samples[0];
+  const baseline = signalBaselineFor(track);
   if (!baseline) return;
   for (const [label, windowMs] of [['15m', 15 * 60000], ['30m', 30 * 60000], ['60m', 60 * 60000]]) {
     if (track.reported[label] || now - baseline.ts < windowMs) continue;
@@ -89,6 +95,7 @@ function evaluateSurvival(track, now) {
     if (!target || target.ts < baseline.ts + windowMs - 90000) continue;
     const ok = survivalQuality(target, baseline);
     const outcome = outcomeFor(track, windowMs);
+    if (!outcome) continue;
     track.reported[label] = ok ? 'PASS' : 'FAIL';
     track.outcomes[label] = outcome;
     if (ok) summary[label === '15m' ? 'survived15m' : label === '30m' ? 'survived30m' : 'survived60m']++;
@@ -102,7 +109,7 @@ function trackSample(input, stageInfo) {
   const now = Date.now();
   let track = tracks.get(address);
   if (!track) {
-    track = { address, symbol: input.symbol || '?', firstSeen: now, samples: [], reported: {}, outcomes: {}, acceleration: null, lastRecorded: 0 };
+    track = { address, symbol: input.symbol || '?', firstSeen: now, samples: [], reported: {}, outcomes: {}, signalBaselineTs: null, acceleration: null, lastRecorded: 0 };
     tracks.set(address, track);
     summary.detected++;
   }
@@ -111,13 +118,15 @@ function trackSample(input, stageInfo) {
     ts: now, symbol: input.symbol || track.symbol, stage: stageInfo.stage,
     marketCap: num(input.marketCap), liquidity: num(input.liquidity), volume1h: num(input.volume1h),
     buys: num(input.buys), sells: num(input.sells), trades: num(input.buys) + num(input.sells), pressure: num(input.pressure),
-    change5m: num(input.change5m), change15m: num(input.change15m), change30m: num(input.change30m), score: num(input.score), risk: num(input.risk), riskLevel: input.riskLevel || 'PENDING'
+    change5m: num(input.change5m), change15m: num(input.change15m), change30m: num(input.change30m), score: num(input.score), risk: num(input.risk), riskLevel: input.riskLevel || 'PENDING',
+    ageMs: num(input.ageMs), dexCount: num(input.dexCount), poolCount: num(input.poolCount)
   };
   const previous = track.samples.at(-1);
   track.acceleration = accelerationFor(previous, current);
   current.accelerationScore = track.acceleration.score;
   track.samples.push(current);
   if (track.samples.length > MAX_TRACK_SAMPLES) track.samples.shift();
+  if (!track.signalBaselineTs && SIGNAL_STAGES.has(current.stage)) track.signalBaselineTs = current.ts;
   track.lastRecorded = now;
   track.symbol = current.symbol;
   evaluateSurvival(track, now);
@@ -151,6 +160,7 @@ export function recordTelemetry(input) {
     volume1h: input.volume1h, pressure: input.pressure, trades: (input.buys || 0) + (input.sells || 0), ageMs: input.ageMs ?? null,
     momentum: { m5: input.change5m, m15: input.change15m, m30: input.change30m, h1: input.change1h, h6: input.change6h },
     timeframes: { m5Trades: input.stageSignals?.inputs?.m5Trades ?? null, m15Trades: input.stageSignals?.inputs?.m15Trades ?? null, m30Trades: input.stageSignals?.inputs?.m30Trades ?? null, m15Pressure: input.stageSignals?.inputs?.m15Pressure ?? null, m30Pressure: input.stageSignals?.inputs?.m30Pressure ?? null },
+    dexCount: input.dexCount ?? null, poolCount: input.poolCount ?? null,
     stageSignals: compactSignals(stageSignals), acceleration: track?.acceleration || null
   };
   entries.push(item);
@@ -172,9 +182,9 @@ function aggregateOutcomes(windowLabel) {
   const rows = [];
   for (const track of tracks.values()) {
     const outcome = track.outcomes?.[windowLabel];
-    const baseline = track.samples[0];
+    const baseline = signalBaselineFor(track);
     if (!outcome || !baseline) continue;
-    rows.push({ ...outcome, stage: baseline.stage, scoreBucket: bucketScore(baseline.score), dexCount: num(baseline.dexCount), ageMinutes: (baseline.ageMs || 0) / 60000 });
+    rows.push({ ...outcome, stage: baseline.stage, scoreBucket: bucketScore(baseline.score), dexCount: num(baseline.dexCount), poolCount: num(baseline.poolCount), ageMinutes: num(baseline.ageMs) / 60000 });
   }
   const group = (keyFn) => {
     const map = new Map();
@@ -192,20 +202,21 @@ function aggregateOutcomes(windowLabel) {
       avgDrawdownPct: Math.round(list.reduce((s, x) => s + num(x.drawdownPct), 0) / list.length * 10) / 10
     }]));
   };
-  return { samples: rows.length, byStage: group(x => x.stage), byScore: group(x => x.scoreBucket) };
+  return { samples: rows.length, byStage: group(x => x.stage), byScore: group(x => x.scoreBucket), byDexCount: group(x => String(x.dexCount)) };
 }
 
 export function getTelemetryForToken(address) {
   const track = tracks.get(String(address || '').toLowerCase());
   if (!track) return null;
   const latest = track.samples.at(-1) || null;
-  return { firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest };
+  const baseline = signalBaselineFor(track);
+  return { firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, signalBaseline: baseline, acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest };
 }
 
 export function telemetrySnapshot(token = '') {
   const needle = String(token || '').trim().toLowerCase();
   const filtered = needle ? entries.filter(x => String(x.token || '').toLowerCase() === needle || String(x.address || '').toLowerCase() === needle || String(x.symbol || '').toLowerCase() === needle) : entries;
-  const tracked = [...tracks.values()].map(track => ({ address: track.address, symbol: track.symbol, firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest: track.samples.at(-1) || null })).sort((a, b) => (b.acceleration?.score || 0) - (a.acceleration?.score || 0));
+  const tracked = [...tracks.values()].map(track => ({ address: track.address, symbol: track.symbol, firstSeen: track.firstSeen, ageMinutes: Math.round((Date.now() - track.firstSeen) / 60000), samples: track.samples.length, signalBaseline: signalBaselineFor(track), acceleration: track.acceleration, survival: { ...track.reported }, outcomes: { ...track.outcomes }, latest: track.samples.at(-1) || null })).sort((a, b) => (b.acceleration?.score || 0) - (a.acceleration?.score || 0));
   return {
     at: new Date().toISOString(), buffer: filtered.length, maxBuffer: MAX_ENTRIES, trackedTokens: tracks.size,
     summary: { ...summary, stageCounts: { ...summary.stageCounts }, rejectionReasons: { ...summary.rejectionReasons }, conditionFailures: Object.fromEntries(Object.entries(summary.conditionFailures).map(([k, v]) => [k, { ...v }])) },
